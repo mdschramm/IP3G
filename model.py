@@ -1,33 +1,16 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-
-from google.colab import drive
-drive.mount('/content/drive')
-
-
-# In[2]:
-
-
-root = '/content/drive/MyDrive/Ravaee/GTEX/'
-
-
-# In[3]:
-
-
 from tensorflow import keras
 from tensorflow.keras import layers
 import tensorflow as tf
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import numpy as np
-import imageio
-import datetime
+# import imageio
+# import datetime
 
 
-# In[4]:
 
 
 batch_size = 64
@@ -36,17 +19,17 @@ image_size = 128
 latent_dim = 128
 
 
-# In[5]:
+# DATA_FILE = f"{root}data.npy"
+DATA_FILE = "sample_data.npy"
+x_train = np.load(DATA_FILE)
 
-
-x_train =np.load(root+'data.npy')
+# -1 to 1 normalization
 x_train = x_train * 2.0 - 1.0
 c_cat_dim = 54
 x_train = x_train.astype("float32")
 x_train = np.reshape(x_train, [-1, image_size, image_size, 1])
 
 
-# In[6]:
 
 
 # Create tf.data.Dataset.
@@ -54,9 +37,6 @@ dataset = tf.data.Dataset.from_tensor_slices((x_train))
 dataset = dataset.shuffle(buffer_size=1024).batch(batch_size)
 
 print(f"Shape of training images: {x_train.shape}")
-
-
-# In[7]:
 
 
 def get_discriminator_model():
@@ -83,7 +63,6 @@ def get_discriminator_model():
   return d_model, q_model
 
 
-# In[8]:
 
 
 def get_generator_model():
@@ -112,24 +91,21 @@ def get_generator_model():
   return g_model
 
 
-# In[9]:
 
 
 d_model, q_network = get_discriminator_model()
-# d_model.summary()
+d_model.summary()
 # d_model = tf.keras.models.load_model('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN Discriminator.h5')
 # q_network = tf.keras.models.load_model('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN q-net.h5')
 
 
-# In[10]:
 
 
 g_model = get_generator_model()
-# g_model.summary()
+g_model.summary()
 # g_model = tf.keras.models.load_model('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN Generator.h5')
 
 
-# In[11]:
 
 
 class WINFOGAN(keras.Model):
@@ -228,8 +204,9 @@ class WINFOGAN(keras.Model):
         with tf.GradientTape() as g_tape, tf.GradientTape() as qn_tape:
             self.discriminator.trainable = False
             
-            g_tape.watch(self.generator.trainable_variables)
-            qn_tape.watch(self.q_network.trainable_variables)
+            # NOt needed as gradienttape automatically records the trainable variables
+            # g_tape.watch(self.generator.trainable_variables)
+            # qn_tape.watch(self.q_network.trainable_variables)
             
             # Generate fake images using the generator
             generated_images = self.generator([random_latent_vectors,labels], training=True)
@@ -265,7 +242,6 @@ class WINFOGAN(keras.Model):
         }
 
 
-# In[12]:
 
 
 def discriminator_loss(real_img, fake_img):
@@ -279,7 +255,6 @@ def generator_loss(fake_img):
     return -tf.reduce_mean(fake_img)
 
 
-# In[13]:
 
 
 class GANMonitor(tf.keras.callbacks.Callback):
@@ -306,13 +281,11 @@ class GANMonitor(tf.keras.callbacks.Callback):
         plt.show()
 
 
-# In[14]:
 
 
 callback = GANMonitor(latent_dim=latent_dim)
 
 
-# In[15]:
 
 
 info_gan = WINFOGAN(
@@ -328,17 +301,21 @@ info_gan.compile(
 )
 
 
-# In[ ]:
 
+print("stuff")
+# history = info_gan.fit(dataset, epochs=2000 , callbacks=[callback])
+history = info_gan.fit(dataset, epochs=100 , callbacks=[callback])
 
-info_gan.fit(dataset, epochs=200 , callbacks=[callback])
 # cond_gan.fit(dataset, epochs=20)
 
+# Save info_gan model weights
+info_gan.generator.save('generator.h5')
+info_gan.discriminator.save('discriminator.h5')
+info_gan.q_network.save('q_network.h5')
+info_gan.save('info_gan.h5')
 
-# In[ ]:
 
 
-# info_gan.generator.save('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN Generator.h5')
-# info_gan.discriminator.save('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN Discriminator.h5')
-# info_gan.q_network.save('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN q-net.h5')
+
+
 
