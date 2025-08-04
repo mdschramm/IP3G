@@ -92,8 +92,11 @@ for line in f:
     values = np.asarray(values)
     if values.mean() >= 0.1:
         gen_count +=1
-        clear_output(wait=True)
-        print(gen_count)
+        if gen_count % 1000 == 0:
+            print(gen_count)
+        # clear_output(wait=True)
+        # print(gen_count)
+print(gen_count)
 f.close()
 
 
@@ -106,7 +109,7 @@ data = np.zeros((gen_count , sample_count), dtype='float32')
 # In[10]:
 
 
-f = open(r'TcgaTargetGtex_RSEM_Hugo_norm_count')
+f = open(r'gtex_RSEM_Hugo_norm_count')
 f.readline()
 i = 0
 for line in f:
@@ -116,7 +119,8 @@ for line in f:
     if values.mean() >= 0.1:
         data[i] = values
         i += 1
-        print(i)
+        if i % 10000 == 0:
+          print(f"Added {i} rows to data")
         clear_output(wait=True)
 f.close()
 

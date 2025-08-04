@@ -1,5 +1,7 @@
-GTEX_phenotype.txt
+GTEX_phenotype
 gtex_RSEM_Hugo_norm_count
 gtex_gene_expected_count
 notes.md
 .DS_Store
+loaded_data
+__pycache__
