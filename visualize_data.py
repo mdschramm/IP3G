@@ -4,8 +4,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 from scipy.spatial import ConvexHull
-
-from preprocess_data import load_if_not_exists, calculate_data
+import math
+from tensorflow.keras.utils import to_categorical
+from preprocess_data import load_if_not_exists, calculate_data, load_samples, generate_phenotype_mapping, get_phenotypes, GTEX_PHENOTYPE
 
 def get_tsne_data(data):
     tsne = TSNE(n_components=2, verbose=1)
@@ -137,12 +138,24 @@ def create_expression_images_from_tsne(sample_gene_expressions, normalized_tsne,
     return data
 
 def pad_data(data, pad_size):
-    left_padd = math.floor((pad_size - data.shape[1])/2)
-    right_padd = math.ceil((pad_size - data.shape[1])/2)
-    top_padd = math.floor((pad_size - data.shape[2])/2)
-    bottom_padd = math.ceil((pad_size - data.shape[2])/2)
+    left_padd = max(0, math.floor((pad_size - data.shape[1])/2))
+    right_padd = max(0, math.ceil((pad_size - data.shape[1])/2))
+    top_padd = max(0, math.floor((pad_size - data.shape[2])/2))
+    bottom_padd = max(0, math.ceil((pad_size - data.shape[2])/2))
     data = np.pad(data , [(0,0),(left_padd,right_padd),(top_padd,bottom_padd)], 'constant')
     return data
+
+def get_y_train(phenotypes):
+    set_labels = set(phenotypes)
+    num_classes = len(set_labels)
+    dict_labels = {}
+    for i,l in enumerate(set_labels):
+        dict_labels[l] = i
+    labels = []
+    for l in phenotypes:
+        labels.append(dict_labels[l])
+    y_train = to_categorical(labels , num_classes=num_classes)
+    return y_train
 
 if __name__ == "__main__":
     sample_gene_expressions = load_if_not_exists("loaded_data/data.npy", calculate_data)
@@ -166,7 +179,13 @@ if __name__ == "__main__":
 
     data, w, h = initialize_image_data(sample_gene_expressions, normalized_tsne)
 
-    data = create_expression_images_from_tsne(sample_gene_expressions, normalized_tsne, data, w, h)
+    data = load_if_not_exists("loaded_data/unpadded_expressions.npy", create_expression_images_from_tsne, 
+    sample_gene_expressions=sample_gene_expressions,
+    normalized_tsne=normalized_tsne,
+    data=data,
+    w=w,
+    h=h)
+    
 
     # Pad images to 128x128
     pad_size = 128
@@ -175,6 +194,28 @@ if __name__ == "__main__":
     # Todos
     # Generate some sample images for a few patient samples
     # Get phenotypes and y_train values for those patients
+    samples = load_if_not_exists("loaded_data/samples.npy", load_samples)
+    
+    # Map phenotypes to samples
+    phenotype_mapping = load_if_not_exists("loaded_data/sample_to_body_site_mapping.json", generate_phenotype_mapping)
+
+    # Use phenotype mapping to create list of phenotypes for all the samples
+    sample_body_site_phenotypes = load_if_not_exists("loaded_data/sample_body_site_phenotypes.npy", 
+    get_phenotypes, 
+    samples=samples, 
+    sample_to_phenotype=phenotype_mapping)
+
+    y_train_primary_disease_or_tissue =load_if_not_exists("loaded_data/y_primary_disease_or_tissue.npy", get_y_train, phenotypes=sample_body_site_phenotypes)
+
+    primary_site_mapping = load_if_not_exists("loaded_data/primary_site_mapping.json", generate_phenotype_mapping, source_file=GTEX_PHENOTYPE, target_column=2)
+    sample_primary_site_phenotypes = load_if_not_exists("loaded_data/sample_primary_site_phenotypes.npy", get_phenotypes, samples=samples, sample_to_phenotype=primary_site_mapping)
+    y_train_primary_site =load_if_not_exists("loaded_data/y_primary_site.npy", get_y_train, phenotypes=sample_primary_site_phenotypes)
+
+    print()
+    # Get dimensions and total counts
+    # Confirm with professor.
+
+
     # Get dimensions and total counts
     # Confirm with professor.
 

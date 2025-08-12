@@ -152,7 +152,7 @@ def calculate_data():
 
     data = np.asarray(data)
     return data.T
-  
+
 
 if __name__ == "__main__":
   # Get list of samples
@@ -163,7 +163,7 @@ if __name__ == "__main__":
   # Map phenotypes to samples
   phenotype_mapping = load_if_not_exists("loaded_data/sample_to_body_site_mapping.json", generate_phenotype_mapping)
 
-  # Use phenotype mapping to create list of phenotypes for all the smaples
+  # Use phenotype mapping to create list of phenotypes for all the samples
   sample_body_site_phenotypes = load_if_not_exists("loaded_data/sample_body_site_phenotypes.npy", 
   get_phenotypes, 
   samples=samples, 
