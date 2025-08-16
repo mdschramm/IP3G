@@ -4,9 +4,12 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 from scipy.spatial import ConvexHull
+from scipy.ndimage import zoom
 import math
 from tensorflow.keras.utils import to_categorical
 from preprocess_data import load_if_not_exists, calculate_data, load_samples, generate_phenotype_mapping, get_phenotypes, GTEX_PHENOTYPE
+
+TARGET_SIZE = 128
 
 def get_tsne_data(data):
     tsne = TSNE(n_components=2, verbose=1)
@@ -138,6 +141,9 @@ def create_expression_images_from_tsne(sample_gene_expressions, normalized_tsne,
     return data
 
 def pad_data(data, pad_size):
+    if data.shape[1] > pad_size or data.shape[2] > pad_size:
+        print(f"Warning: Data shape {data.shape[1]}x{data.shape[2]} is larger than pad size {pad_size}")
+        return data
     left_padd = max(0, math.floor((pad_size - data.shape[1])/2))
     right_padd = max(0, math.ceil((pad_size - data.shape[1])/2))
     top_padd = max(0, math.floor((pad_size - data.shape[2])/2))
@@ -156,6 +162,13 @@ def get_y_train(phenotypes):
         labels.append(dict_labels[l])
     y_train = to_categorical(labels , num_classes=num_classes)
     return y_train
+
+def resize_images(images, target_size=TARGET_SIZE):
+    # images: shape (n_samples, w, h)
+    n, w, h = images.shape
+    zoom_factors = (1, target_size / w, target_size / h)
+    resized = zoom(images, zoom_factors, order=3)  # order=3: cubic interpolation
+    return resized
 
 if __name__ == "__main__":
     sample_gene_expressions = load_if_not_exists("loaded_data/data.npy", calculate_data)
@@ -185,31 +198,41 @@ if __name__ == "__main__":
     data=data,
     w=w,
     h=h)
-    
 
-    # Pad images to 128x128
-    pad_size = 128
+    # Images are 148 x 148 so padding doesn't work
+    pad_size = TARGET_SIZE
     data = pad_data(data, pad_size)
 
-    # Todos
-    # Generate some sample images for a few patient samples
-    # Get phenotypes and y_train values for those patients
+    # Resize larger images to 128x128
+    data = load_if_not_exists("loaded_data/resized_expressions.npy",
+     resize_images,
+     images=data,
+     target_size=TARGET_SIZE)
+
     samples = load_if_not_exists("loaded_data/samples.npy", load_samples)
     
-    # Map phenotypes to samples
+    # Get y_train of primary disease
     phenotype_mapping = load_if_not_exists("loaded_data/sample_to_body_site_mapping.json", generate_phenotype_mapping)
-
-    # Use phenotype mapping to create list of phenotypes for all the samples
     sample_body_site_phenotypes = load_if_not_exists("loaded_data/sample_body_site_phenotypes.npy", 
-    get_phenotypes, 
-    samples=samples, 
-    sample_to_phenotype=phenotype_mapping)
+        get_phenotypes, 
+        samples=samples, 
+        sample_to_phenotype=phenotype_mapping)
+    y_train_primary_disease_or_tissue =load_if_not_exists("loaded_data/y_primary_disease_or_tissue.npy",
+        get_y_train,
+        phenotypes=sample_body_site_phenotypes)
 
-    y_train_primary_disease_or_tissue =load_if_not_exists("loaded_data/y_primary_disease_or_tissue.npy", get_y_train, phenotypes=sample_body_site_phenotypes)
-
-    primary_site_mapping = load_if_not_exists("loaded_data/primary_site_mapping.json", generate_phenotype_mapping, source_file=GTEX_PHENOTYPE, target_column=2)
-    sample_primary_site_phenotypes = load_if_not_exists("loaded_data/sample_primary_site_phenotypes.npy", get_phenotypes, samples=samples, sample_to_phenotype=primary_site_mapping)
-    y_train_primary_site =load_if_not_exists("loaded_data/y_primary_site.npy", get_y_train, phenotypes=sample_primary_site_phenotypes)
+    # Get y_train of primary site
+    primary_site_mapping = load_if_not_exists("loaded_data/primary_site_mapping.json", 
+        generate_phenotype_mapping, 
+        source_file=GTEX_PHENOTYPE, 
+        target_column=2)
+    sample_primary_site_phenotypes = load_if_not_exists("loaded_data/sample_primary_site_phenotypes.npy",
+        get_phenotypes,
+        samples=samples,
+        sample_to_phenotype=primary_site_mapping)
+    y_train_primary_site =load_if_not_exists("loaded_data/y_primary_site.npy",
+        get_y_train,
+        phenotypes=sample_primary_site_phenotypes)
 
     print()
     # Get dimensions and total counts

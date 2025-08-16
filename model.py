@@ -20,7 +20,8 @@ latent_dim = 128
 
 
 # DATA_FILE = f"{root}data.npy"
-DATA_FILE = "sample_data.npy"
+# DATA_FILE = "sample_data.npy"
+DATA_FILE = "loaded_data/resized_expressions.npy"
 x_train = np.load(DATA_FILE)
 
 # -1 to 1 normalization

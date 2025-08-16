@@ -30,46 +30,6 @@ from collections import Counter
 import json
 import time
 
-"""
-PORTED from convert to image.py
-
-Data sources:
-1. gtex_gene_expected_count (https://xenabrowser.net/datapages/?dataset=gtex_gene_expected_count&host=https%3A%2F%2Ftoil.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443)
-2. GTEX_phenotype (https://xenabrowser.net/datapages/?dataset=GTEX_phenotype&host=https%3A%2F%2Ftoil.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443)
-3. TcgaTargetGtex_RSEM_Hugo_norm_count (https://xenabrowser.net/datapages/?dataset=TcgaTargetGtex_RSEM_Hugo_norm_count&host=https%3A%2F%2Ftoil.xenahubs.net&removeHub=https%3A%2F%2Fxena.treehouse.gi.ucsc.edu%3A443)
-
-Built from convert to image.py
-
-samples, _dict, phenotypes:
-
-1. Opens gtex_gene_expected_count which is a 60,499 identifiers X 7845 samples matrix
-- Obtains "samples" from columns
-2. Opens GTEX_phenotype which is a 9783 samples X 6 identifiers matrix
-- Creates _dict mapping from sample name to "body site detail (SMTSD)"
-
-Creates phenotype list of body site detail (SMTSD) from "samples" if they exist in _dict
-
--- Use Counter(phenotypes) as validation
-
-gen_count
-3. Iterates over lines in gtex_gene_expected_count and counts number of lines where mean expression >= 0.1
-
-data
-4. Creates data numpy array of size (gen_count, sample_count)
-
-5. Opens TcgaTargetGtex_RSEM_Hugo_norm_count which is a 58,582 identifiers X 7851 samples matrix
-- Iterates over lines in TcgaTargetGtex_RSEM_Hugo_norm_count and sets row i of data
-  if mean expression >= 0.1
-
-This implies that the qualifying lines of TcgaTargetGtex_RSEM_Hugo_norm_count align to the 
-qualifying lines of gtex_gene_expected_count
-
-y_train
-6. Each phenotype is assigned a unique integer label. The phenotype list is then iterated over to create a list of labels.
-The list of labels is converted into a categorical variable with tensorflow.keras.utils.to_categorical
-
-"""
-
 BASE_DATA_DIR = "loaded_data"
 
 # List of samples and their features and phenotypes
