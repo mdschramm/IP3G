@@ -56,12 +56,14 @@ def load_if_not_exists(file_path, calculate, **kwargs):
     print(f"Ran in in {time.time() - start_time} seconds")
     try:
       mode = "w" if use_json else "wb"
+      print(f"Writing to {file_path}")
       with open(file_path, mode) as f:
         if use_json:
           save_fn(data, f)
         else:
           save_fn(f, data)
     except Exception as e:
+      print(f"Failed to write to {file_path}: {e}")
       # Remove file if it exists
       if os.path.exists(file_path):
         os.remove(file_path)

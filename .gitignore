@@ -5,3 +5,4 @@ notes.md
 .DS_Store
 loaded_data
 __pycache__
+*.keras

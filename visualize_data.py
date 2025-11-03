@@ -14,6 +14,7 @@ TARGET_SIZE = 128
 def get_tsne_data(data):
     tsne = TSNE(n_components=2, verbose=1)
     tsne_results = tsne.fit_transform(data.T)
+    print("Finished t-SNE")
     return tsne_results
 
 def plot_tsne(tsne_results):
@@ -86,6 +87,8 @@ def minimum_bounding_rectangle(points):
     rval[2] = np.dot([x2, y1], r)
     rval[3] = np.dot([x1, y1], r)
 
+    print("Finished minimum bounding rectangle")
+
     return rval
     
 
@@ -111,6 +114,7 @@ def rotate(p, origin=(0, 0), theta=0):
 
 def compute_rotation(bbox):
     theta = np.arctan((bbox[0][1]-bbox[1][1])/(bbox[0][0] - bbox[1][0]))
+    print("Finished compute rotation")
     return -theta
 
 def initialize_image_data(sample_gene_expressions, normalized_tsne):
@@ -138,6 +142,7 @@ def create_expression_images_from_tsne(sample_gene_expressions, normalized_tsne,
 
     # Normalize gene expression values for all samples
     data = data / np.max(data)
+    print("Finished create expression images from tsne")
     return data
 
 def pad_data(data, pad_size):
@@ -169,6 +174,11 @@ def resize_images(images, target_size=TARGET_SIZE):
     zoom_factors = (1, target_size / w, target_size / h)
     resized = zoom(images, zoom_factors, order=3)  # order=3: cubic interpolation
     return resized
+
+# Takes numpy array and renders it as an image
+def render_image(image):
+    plt.imshow(image)
+    plt.show()
 
 if __name__ == "__main__":
     sample_gene_expressions = load_if_not_exists("loaded_data/data.npy", calculate_data)

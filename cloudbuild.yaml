@@ -1,0 +1,14 @@
+# Uses contents of Dockerfile to build image and push to directory in artifact registry
+substitutions:
+  _HOST: us-east1-docker.pkg.dev
+  _REPO: mark-ip3g-repo
+  _IMAGE: ip3g
+  _TAG: latest
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    script: |
+      docker build -t ${_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG} .
+    automapSubstitutions: true
+images:
+  - "${_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG}"

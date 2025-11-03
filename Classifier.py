@@ -22,14 +22,14 @@ from tensorflow.keras import backend as K
 # In[2]:
 
 
-root = '/content/drive/MyDrive/Ravaee/GTEX/'
+# root = '/content/drive/MyDrive/Ravaee/GTEX/'
 
 
 # In[3]:
 
 
-from google.colab import drive
-drive.mount('/content/drive')
+# from google.colab import drive
+# drive.mount('/content/drive')
 
 
 # In[4]:

@@ -7,37 +7,40 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 import tensorflow as tf
 import numpy as np
+import os
 # import imageio
 # import datetime
 
+LATENT_DIM = 128
+C_CAT_DIM = 54
+NUM_CHANNELS = 1
+BATCH_SIZE = 64
+IMAGE_SIZE = 128
+EPOCHS = 1
+DATA_DIR = "loaded_data"
+GENERATOR_MODEL_FILE = f"{DATA_DIR}/generator.keras"
+DISCRIMINATOR_MODEL_FILE = f"{DATA_DIR}/discriminator.keras"
+Q_NETWORK_MODEL_FILE = f"{DATA_DIR}/q_network.keras"
 
 
+def initialize_dataset():
 
-batch_size = 64
-num_channels = 1
-image_size = 128
-latent_dim = 128
+    # DATA_FILE = f"{root}data.npy"
+    # DATA_FILE = "sample_data.npy"
+    DATA_FILE = f"{DATA_DIR}/resized_expressions.npy"
+    x_train = np.load(DATA_FILE)
 
+    # -1 to 1 normalization
+    x_train = x_train * 2.0 - 1.0
+    x_train = x_train.astype("float32")
+    x_train = np.reshape(x_train, [-1, IMAGE_SIZE, IMAGE_SIZE, NUM_CHANNELS])
 
-# DATA_FILE = f"{root}data.npy"
-# DATA_FILE = "sample_data.npy"
-DATA_FILE = "loaded_data/resized_expressions.npy"
-x_train = np.load(DATA_FILE)
+    # Create tf.data.Dataset.
+    dataset = tf.data.Dataset.from_tensor_slices((x_train))
+    dataset = dataset.shuffle(buffer_size=1024).batch(BATCH_SIZE)
 
-# -1 to 1 normalization
-x_train = x_train * 2.0 - 1.0
-c_cat_dim = 54
-x_train = x_train.astype("float32")
-x_train = np.reshape(x_train, [-1, image_size, image_size, 1])
-
-
-
-
-# Create tf.data.Dataset.
-dataset = tf.data.Dataset.from_tensor_slices((x_train))
-dataset = dataset.shuffle(buffer_size=1024).batch(batch_size)
-
-print(f"Shape of training images: {x_train.shape}")
+    print(f"Shape of training images: {x_train.shape}")
+    return dataset
 
 
 def get_discriminator_model():
@@ -58,21 +61,18 @@ def get_discriminator_model():
   d_model = keras.models.Model(img_input, disc_out, name="discriminator")
 
   q_net_out = layers.Dense(128, activation='relu', kernel_initializer='he_normal' , bias_initializer='he_normal'  )(x)
-  q_net_out = layers.Dense(c_cat_dim , activation='softmax')(q_net_out)
+  q_net_out = layers.Dense(C_CAT_DIM , activation='softmax')(q_net_out)
   q_model = keras.models.Model(img_input, q_net_out, name='q_network')
 
   return d_model, q_model
 
-
-
-
 def get_generator_model():
-  noise = layers.Input(shape=(latent_dim,))
-  labels = layers.Input(shape=(c_cat_dim,))
+  noise = layers.Input(shape=(LATENT_DIM,))
+  labels = layers.Input(shape=(C_CAT_DIM,))
   inputs =layers.concatenate([noise,labels], axis=1)
-  x = layers.Dense(8 * 8 * (latent_dim+c_cat_dim), name='gen_l1')(inputs)
+  x = layers.Dense(8 * 8 * (LATENT_DIM+C_CAT_DIM), name='gen_l1')(inputs)
   x = layers.LeakyReLU(alpha=0.2)(x)
-  x = layers.Reshape((8, 8, latent_dim+c_cat_dim))(x)
+  x = layers.Reshape((8, 8, LATENT_DIM+C_CAT_DIM))(x)
   x = layers.Conv2DTranspose(128, (3, 3), strides=(2, 2), padding="same",use_bias=False)(x)
   x = layers.BatchNormalization()(x)
   x = layers.LeakyReLU(alpha=0.2)(x)
@@ -92,23 +92,6 @@ def get_generator_model():
   return g_model
 
 
-
-
-d_model, q_network = get_discriminator_model()
-d_model.summary()
-# d_model = tf.keras.models.load_model('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN Discriminator.h5')
-# q_network = tf.keras.models.load_model('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN q-net.h5')
-
-
-
-
-g_model = get_generator_model()
-g_model.summary()
-# g_model = tf.keras.models.load_model('/content/drive/MyDrive/Ravaee/GTEX/GE W-InfoGAN Generator.h5')
-
-
-
-
 class WINFOGAN(keras.Model):
     def __init__(self, discriminator, generator,q_network, latent_dim):
         super(WINFOGAN, self).__init__()
@@ -119,7 +102,6 @@ class WINFOGAN(keras.Model):
         self.gen_loss_tracker = keras.metrics.Mean(name="generator_loss")
         self.disc_loss_tracker = keras.metrics.Mean(name="discriminator_loss")
         self.q_loss_tracker = keras.metrics.Mean(name="q_loss")
-        self.batch_size = batch_size
         self.d_steps = 5
         self.gp_weight = 100
 
@@ -163,14 +145,15 @@ class WINFOGAN(keras.Model):
         # Unpack the data.
         real_images = data
 
+        # verify this is same as global BATCH_SIZE
         batch_size = tf.shape(real_images)[0]
 
         for i in range(self.d_steps):
           random_latent_vectors = tf.random.normal(
               shape=(batch_size, self.latent_dim)
           )
-          indx = tf.random.uniform(shape=(batch_size,), minval=0, maxval=c_cat_dim, dtype=tf.int32)
-          labels = tf.one_hot(indx , c_cat_dim)
+          indx = tf.random.uniform(shape=(batch_size,), minval=0, maxval=C_CAT_DIM, dtype=tf.int32)
+          labels = tf.one_hot(indx , C_CAT_DIM)
 
           # Train the discriminator.
           with tf.GradientTape() as tape:
@@ -199,8 +182,8 @@ class WINFOGAN(keras.Model):
          # Train the generator
         # Get the latent vector
         random_latent_vectors = tf.random.normal(shape=(batch_size, self.latent_dim))
-        indx = tf.random.uniform(shape=(batch_size,), minval=0, maxval=c_cat_dim, dtype=tf.int32)
-        labels = tf.one_hot(indx , c_cat_dim)
+        indx = tf.random.uniform(shape=(batch_size,), minval=0, maxval=C_CAT_DIM, dtype=tf.int32)
+        labels = tf.one_hot(indx , C_CAT_DIM)
         
         with tf.GradientTape() as g_tape, tf.GradientTape() as qn_tape:
             self.discriminator.trainable = False
@@ -243,8 +226,6 @@ class WINFOGAN(keras.Model):
         }
 
 
-
-
 def discriminator_loss(real_img, fake_img):
     real_loss = tf.reduce_mean(real_img)
     fake_loss = tf.reduce_mean(fake_img)
@@ -256,16 +237,14 @@ def generator_loss(fake_img):
     return -tf.reduce_mean(fake_img)
 
 
-
-
 class GANMonitor(tf.keras.callbacks.Callback):
-    def __init__(self, latent_dim=128):
+    def __init__(self, latent_dim=LATENT_DIM):
         self.latent_dim = latent_dim
 
     def on_epoch_end(self, epoch, logs=None):
         # Sample noise for the interpolation.
-        _noise = tf.random.normal(shape=(4, latent_dim))
-        _label = keras.utils.to_categorical([0,1,2,3], c_cat_dim)
+        _noise = tf.random.normal(shape=(4, LATENT_DIM))
+        _label = keras.utils.to_categorical([0,1,2,3], C_CAT_DIM)
         _label = tf.cast(_label, tf.float32)
 
         # Combine the noise and the labels and run inference with the generator.
@@ -273,50 +252,87 @@ class GANMonitor(tf.keras.callbacks.Callback):
         fake_images = fake_images * 0.5 + 0.5
         fake_images *= 255.0
         converted_images = fake_images.astype(np.uint8)
-        # converted_images = tf.image.resize(converted_images, (256, 256)).numpy().astype(np.uint8)
+        converted_images = tf.image.resize(converted_images, (256, 256)).numpy().astype(np.uint8)
 
-        
+
         for i in range(4):
           plt.subplot(2,2,i+1)
           plt.imshow(converted_images[i][:,:,0],cmap='gray')
-        plt.show()
+        
+        # Save to gan_monitor_images subfolder
+        output_dir = os.path.join(DATA_DIR, "gan_monitor_images")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"epoch_{epoch:04d}.png")
+        plt.savefig(output_path)
+        plt.close()
+        print(f"Saved GAN monitor image to {output_path}")
 
 
+def train_gan(info_gan,dataset):
+    callback = GANMonitor(LATENT_DIM)
+    # history = info_gan.fit(dataset, epochs=2000 , callbacks=[callback])
+    history = info_gan.fit(dataset, epochs=EPOCHS , callbacks=[callback])
+    return info_gan
+
+def save_gan_components(info_gan):
+    print("Saving GAN components")
+    # Save only the component models, not the custom WINFOGAN wrapper
+    info_gan.generator.save(GENERATOR_MODEL_FILE)
+    info_gan.discriminator.save(DISCRIMINATOR_MODEL_FILE)
+    info_gan.q_network.save(Q_NETWORK_MODEL_FILE)
+
+def compile_info_gan(g_model, d_model, q_network):
+    print("Compiling InfoGAN")
+    info_gan = WINFOGAN(
+        discriminator=d_model, generator=g_model, q_network=q_network, latent_dim=LATENT_DIM
+    )
+    info_gan.compile(
+        d_optimizer=keras.optimizers.Adam(learning_rate=0.0003,beta_1=0.5, beta_2=0.9),
+        g_optimizer=keras.optimizers.Adam(learning_rate=0.0003,beta_1=0.5, beta_2=0.9),
+        q_optimizer=keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.5, beta_2=0.9),
+        g_loss_fn=generator_loss,
+        d_loss_fn=discriminator_loss,
+        q_loss_fn=keras.losses.CategoricalCrossentropy()
+    )
+    return info_gan
 
 
-callback = GANMonitor(latent_dim=latent_dim)
+def load_or_get_component_models(refresh=False):
+    if refresh:
+        print("Refresh: True, re-training models")
+        d_model, q_network = get_discriminator_model()
+        g_model = get_generator_model()
+        return g_model, d_model, q_network
+        
+    try:
+        print("Refresh: False, loading models")
+        g_model = keras.models.load_model(GENERATOR_MODEL_FILE)
+        d_model = keras.models.load_model(DISCRIMINATOR_MODEL_FILE)
+        q_network = keras.models.load_model(Q_NETWORK_MODEL_FILE)
+        return g_model, d_model, q_network
+    except:
+        print("Refresh: False, models not found, re-training")
+        d_model, q_network = get_discriminator_model()
+        g_model = get_generator_model()
+        return g_model, d_model, q_network
 
+def load_or_train_gan(dataset, refresh=False):
+    g_model, d_model, q_network = load_or_get_component_models(refresh)
+    info_gan = compile_info_gan(g_model, d_model, q_network)
+    train_gan(info_gan, dataset)
+    save_gan_components(info_gan)
+    return info_gan
 
+# def migrate_to_keras():
+#     g_model = tf.keras.models.load_model('generator.h5')
+#     d_model = tf.keras.models.load_model('discriminator.h5')
+#     q_network = tf.keras.models.load_model('q_network.h5')
+#     g_model.save("generator.keras")
+#     d_model.save("discriminator.keras")
+#     q_network.save("q_network.keras")
+#     return g_model, d_model, q_network
 
-
-info_gan = WINFOGAN(
-    discriminator=d_model, generator=g_model, q_network=q_network, latent_dim=latent_dim
-)
-info_gan.compile(
-    d_optimizer=keras.optimizers.Adam(learning_rate=0.0003,beta_1=0.5, beta_2=0.9),
-    g_optimizer=keras.optimizers.Adam(learning_rate=0.0003,beta_1=0.5, beta_2=0.9),
-    q_optimizer=keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.5, beta_2=0.9),
-    g_loss_fn=generator_loss,
-    d_loss_fn=discriminator_loss,
-    q_loss_fn=keras.losses.CategoricalCrossentropy()
-)
-
-
-
-print("stuff")
-# history = info_gan.fit(dataset, epochs=2000 , callbacks=[callback])
-history = info_gan.fit(dataset, epochs=100 , callbacks=[callback])
-
-# cond_gan.fit(dataset, epochs=20)
-
-# Save info_gan model weights
-info_gan.generator.save('generator.h5')
-info_gan.discriminator.save('discriminator.h5')
-info_gan.q_network.save('q_network.h5')
-info_gan.save('info_gan.h5')
-
-
-
-
-
-
+if __name__ == "__main__":
+    dataset = initialize_dataset()
+    info_gan = load_or_train_gan(dataset, refresh=True)
+    # migrate_to_keras()
