@@ -3,18 +3,20 @@ GCLOUD_PROJECT_NAME="anita-hunter"
 GCLOUD_MAIN_ACCOUNT="mschramm@gradcenter.cuny.edu"
 GCLOUD_SERVICE_ACCOUNT="309851949944-compute@developer.gserviceaccount.com"
 GCLOUD_REGION_ARTIFACTS="us-east1"
-INSTANCE_NAME="mark-test-inance"
+INSTANCE_NAME="mark-test-instance"
 GCLOUD_ARTIFACTORY_HOST="$GCLOUD_REGION_ARTIFACTS-docker.pkg.dev"
 GCLOUD_REPO="mark-ip3g-repo"
 GCLOUD_IMAGE="ip3g"
 GCLOUD_TAG="latest"
-GCLOUD_INSTANCE_ZONE="us-central1-c"
+GCLOUD_INSTANCE_ZONE="us-central1-b"
 # Get this from cat /etc/os-release on VM - look for VERSION_CODENAME
 # prepend gcsfuse- to the value
-GCSFUSE_REPO="gcsfuse-bullseye"
+GCSFUSE_REPO="gcsfuse-jammy"  # Ubuntu 22.04 (Jammy Jellyfish)
 GCS_BUCKET_NAME="mark-ip3g-data"
 GCLOUD_MOUNT_POINT="/mnt/gcs/mark-ip3g-data"
 USE_GPU=true
+
+NVIDIA_CONTAINER_TOOLKIT_VERSION="1.18.0-1"
 
 
 set_gcloud_project_settings() {
@@ -47,9 +49,9 @@ set_up_docker_image() {
     
     gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker pull $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG"
 
-    # install_gcsfuse
+    install_gcsfuse
 
-    # mount_volumes
+    mount_volumes
 }
 
 # Runs docker image after it's pulled
@@ -60,16 +62,41 @@ run_docker_image() {
     gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always $gpu_flag --rm -it -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG" -- -t
 }
 
-run_gcloud_docker() {
-    set_gcloud_project_settings
-    set_up_docker_image
-    run_docker_image
-}
-
 ## Pushing builds to registry
+# Full build: builds base + runtime from scratch (use when dependencies change)
 push_gcloud_image() {
     echo "Pushing image to gcloud"
-    gcloud builds submit --region=$GCLOUD_REGION_ARTIFACTS --config cloudbuild.yaml
+    DOCKER_BUILDKIT=1 gcloud builds submit --region=$GCLOUD_REGION_ARTIFACTS --config cloudbuild.yaml
+}
+
+# Push base image with :base tag (do this once, or when environment.yml changes)
+push_gcloud_base_image() {
+    echo "Pushing base image (dependencies only) to gcloud"
+    DOCKER_BUILDKIT=1 gcloud builds submit --region=$GCLOUD_REGION_ARTIFACTS --config cloudbuild.yaml --substitutions=_TARGET=base,_TAG=base
+}
+
+# Fast build: uses remote base image, only builds runtime layer (use for code changes)
+push_gcloud_image_fast() {
+    echo "Pushing runtime image using remote base (fast mode)"
+    DOCKER_BUILDKIT=1 gcloud builds submit --region=$GCLOUD_REGION_ARTIFACTS --config cloudbuild.yaml --substitutions=_USE_REMOTE_BASE=true
+}
+
+# Build locally for testing (much faster than cloud build for iteration)
+build_local() {
+    echo "Building image locally with BuildKit"
+    DOCKER_BUILDKIT=1 docker build -t $GCLOUD_IMAGE:$GCLOUD_TAG .
+}
+
+# Build locally using remote base (fastest for code changes)
+build_local_fast() {
+    echo "Building image locally using remote base (fast mode)"
+    DOCKER_BUILDKIT=1 docker build --build-arg USE_REMOTE_BASE=true -t $GCLOUD_IMAGE:$GCLOUD_TAG .
+}
+
+# Build only base stage locally (for testing dependency changes)
+build_local_base() {
+    echo "Building base image (dependencies only) locally with BuildKit"
+    DOCKER_BUILDKIT=1 docker build --target base -t $GCLOUD_IMAGE:base .
 }
 
 # Force-kill any running containers of this image on the VM
@@ -89,13 +116,21 @@ enable_permissions_on_output_dir_for_docker() {
 }
 
 # Run the container detached and named, so you can tail logs or exec a shell
+# Usage: run_docker_image_detached [script_name]
+# Example: run_docker_image_detached "model.py" or run_docker_image_detached (uses default)
 run_docker_image_detached() {
+    local script="${1:-}"  # Optional script argument, empty string if not provided
     echo "Running docker image (detached) on $INSTANCE_NAME"
     local gpu_flag=""
     if [ "${USE_GPU:-false}" = "true" ]; then gpu_flag="--gpus all"; fi
     local name="${CONTAINER_NAME:-ip3g}"
-    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm -d --name $name $gpu_flag -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro -v ~/loaded_data:/app/loaded_data $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm -d --name $name $gpu_flag -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro -v ~/loaded_data:/app/loaded_data $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG $script"
 }
+
+run_script_detached() {
+    command=""
+}
+
 
 tail_ip3g_logs() {
     local name="${CONTAINER_NAME:-ip3g}"
@@ -109,21 +144,65 @@ stop_ip3g_container() {
     gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker stop $name || true"
 }
 
+install_nvidia_gpu_driver() {
+    # ubuntu 22.04
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt update && sudo apt install -y build-essential && sudo apt install -y cmake"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt update && curl -L https://storage.googleapis.com/compute-gpu-installation-us/installer/latest/cuda_installer.pyz --output cuda_installer.pyz"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_driver --installation-mode=binary --installation-branch=prod"
+    # reboot instance and continue run
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo reboot"
+    sleep 30
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_driver --installation-mode=binary --installation-branch=prod"
+
+    # install lub vulkan
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt install libvulkan1"
+
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_cuda --installation-mode=binary --installation-branch=prod"
+    # reboot instance again and rerun
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo reboot"
+    sleep 30
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_cuda --installation-mode=binary --installation-branch=prod"    
+
+    # verify cuda
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="python3 cuda_installer.pyz verify_cuda"
+}
+
+
+
 # Install and configure NVIDIA Container Toolkit on the VM for GPU passthrough
 configure_nvidia_container_toolkit() {
     echo "Configuring NVIDIA Container Toolkit on $INSTANCE_NAME"
-    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="bash -lc 'set -e; if ! command -v nvidia-smi >/dev/null 2>&1; then echo \"WARNING: NVIDIA driver not found on VM. Install the NVIDIA driver and reboot before using GPU.\"; fi; distribution=\$( . /etc/os-release; echo \$ID\$VERSION_ID ); curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg; curl -fsSL https://nvidia.github.io/libnvidia-container/\$distribution/libnvidia-container.list | sed \"s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g\" | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null; sudo apt-get update; sudo apt-get install -y nvidia-container-toolkit; sudo nvidia-ctk runtime configure --runtime=docker; sudo systemctl restart docker'"
+    # gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="bash -lc 'set -e; if ! command -v nvidia-smi >/dev/null 2>&1; then echo \"WARNING: NVIDIA driver not found on VM. Install the NVIDIA driver and reboot before using GPU.\"; fi; distribution=\$( . /etc/os-release; echo \$ID\$VERSION_ID ); curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg; curl -fsSL https://nvidia.github.io/libnvidia-container/\$distribution/libnvidia-container.list | sed \"s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g\" | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null; sudo apt-get update; sudo apt-get install -y nvidia-container-toolkit; sudo nvidia-ctk runtime configure --runtime=docker; sudo systemctl restart docker'"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+        curl \
+        gnupg2"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+        && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get update"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get install -y \
+            nvidia-container-toolkit=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+            nvidia-container-toolkit-base=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+            libnvidia-container-tools=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+            libnvidia-container1=$NVIDIA_CONTAINER_TOOLKIT_VERSION"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo systemctl restart docker"
+    
 }
 
-# Quick verification that the GPU is visible on the host and in a container
-verify_gpu() {
-    echo "Host GPU check (nvidia-smi) on $INSTANCE_NAME"
-    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="nvidia-smi || true"
-    echo "Container GPU check via NVIDIA CUDA base image"
-    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --rm --gpus all nvidia/cuda:12.3.2-base-ubuntu22.04 nvidia-smi"
+configure_docker_nvidia() {
+    set_up_docker_image
+    install_nvidia_gpu_driver
+    configure_nvidia_container_toolkit
 }
 
 # Steps to set up nvidia driver and cuda toolkit: https://cloud.google.com/compute/docs/gpus/install-drivers-gpu#no-secure-boot
 # make sure to use mode=binary and branch=prod for everything
 # also had to manually install vulcan
 # Manually ran some of the commands in configure_nvidia-toolkit which sets up docker to use the nvidia runtime
+
+download_compute_loaded_data_from_gcloud() {
+    gcloud compute scp $INSTANCE_NAME:~/loaded_data/classifier_accuracy.png ./loaded_data_remote/classifier_accuracy.png --project="$GCLOUD_PROJECT_NAME" --zone="$GCLOUD_INSTANCE_ZONE"
+    gcloud compute scp $INSTANCE_NAME:~/loaded_data/classifier_loss.png ./loaded_data_remote/classifier_loss.png --project="$GCLOUD_PROJECT_NAME" --zone="$GCLOUD_INSTANCE_ZONE"
+    gcloud compute scp $INSTANCE_NAME:~/loaded_data/classifier.keras ./loaded_data_remote/classifier.keras --project="$GCLOUD_PROJECT_NAME" --zone="$GCLOUD_INSTANCE_ZONE"
+}

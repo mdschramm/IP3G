@@ -319,8 +319,9 @@ def load_or_get_component_models(refresh=False):
 def load_or_train_gan(dataset, refresh=False):
     g_model, d_model, q_network = load_or_get_component_models(refresh)
     info_gan = compile_info_gan(g_model, d_model, q_network)
-    train_gan(info_gan, dataset)
-    save_gan_components(info_gan)
+    if refresh:
+        train_gan(info_gan, dataset)
+        save_gan_components(info_gan)
     return info_gan
 
 # def migrate_to_keras():
@@ -334,5 +335,6 @@ def load_or_train_gan(dataset, refresh=False):
 
 if __name__ == "__main__":
     dataset = initialize_dataset()
-    info_gan = load_or_train_gan(dataset, refresh=True)
+    info_gan = load_or_train_gan(dataset, refresh=False)
+    info_gan.summary()
     # migrate_to_keras()

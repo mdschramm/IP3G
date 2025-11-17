@@ -114,7 +114,6 @@ def rotate(p, origin=(0, 0), theta=0):
 
 def compute_rotation(bbox):
     theta = np.arctan((bbox[0][1]-bbox[1][1])/(bbox[0][0] - bbox[1][0]))
-    print("Finished compute rotation")
     return -theta
 
 def initialize_image_data(sample_gene_expressions, normalized_tsne):
@@ -179,6 +178,8 @@ def resize_images(images, target_size=TARGET_SIZE):
 def render_image(image):
     plt.imshow(image)
     plt.show()
+
+# RSEM_HUGO_NORM_COUNT -> TSNE -> BBOX + ROTATE -> NORMALIZE -> PAD + RESIZE
 
 if __name__ == "__main__":
     sample_gene_expressions = load_if_not_exists("loaded_data/data.npy", calculate_data)
