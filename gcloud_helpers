@@ -204,5 +204,5 @@ configure_docker_nvidia() {
 download_compute_loaded_data_from_gcloud() {
     gcloud compute scp $INSTANCE_NAME:~/loaded_data/classifier_accuracy.png ./loaded_data_remote/classifier_accuracy.png --project="$GCLOUD_PROJECT_NAME" --zone="$GCLOUD_INSTANCE_ZONE"
     gcloud compute scp $INSTANCE_NAME:~/loaded_data/classifier_loss.png ./loaded_data_remote/classifier_loss.png --project="$GCLOUD_PROJECT_NAME" --zone="$GCLOUD_INSTANCE_ZONE"
-    gcloud compute scp $INSTANCE_NAME:~/loaded_data/classifier.keras ./loaded_data_remote/classifier.keras --project="$GCLOUD_PROJECT_NAME" --zone="$GCLOUD_INSTANCE_ZONE"
+    gcloud compute scp $INSTANCE_NAME:~/loaded_data/classifier_weights_only.keras ./loaded_data_remote/classifier_weights_only.keras --project="$GCLOUD_PROJECT_NAME" --zone="$GCLOUD_INSTANCE_ZONE"
 }

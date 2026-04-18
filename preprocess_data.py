@@ -37,16 +37,24 @@ GTEX_PHENOTYPE = "GTEX_phenotype"
 # List of gene expressions across samples
 RSEM_HUGO_NORM_COUNT = "gtex_RSEM_Hugo_norm_count"
 
-# Calculates data using calculate function and saves it to file_path if it doesn't exist
-# otherwise loads it from file_path
-# kwargs are passed to the calculate function
-# example usage:
-# load_if_not_exists("loaded_data/samples.json", load_samples)
-def load_if_not_exists(file_path, calculate, **kwargs):
+def load_if_not_exists(file_path, calculate, force=True, **kwargs):
+  """
+  Cache wrapper that calculates and saves data if it doesn't exist, otherwise loads from file.
+  
+  Args:
+    file_path: Path to cache file (.json or .npy)
+    calculate: Function to call if cache doesn't exist
+    force: If True, recalculate even if cache exists
+    **kwargs: Arguments passed to calculate function
+    
+  Returns:
+    Data loaded from cache or calculated by calculate function
+    Shape depends on the calculate function used
+  """
   use_json = os.path.splitext(file_path)[1] == ".json"
   load_fn = json.load if use_json else np.load
   save_fn = json.dump if use_json else np.save
-  if os.path.exists(file_path):
+  if os.path.exists(file_path) and not force:
     mode = "r" if use_json else "rb"
     with open(file_path, mode) as f:
       return load_fn(f)
@@ -71,16 +79,38 @@ def load_if_not_exists(file_path, calculate, **kwargs):
       raise
     return data
 
-# Loads sample data
 def load_samples():
+  """
+  Load sample IDs from the header row of gene expression file.
+  
+  Reads: First line of RSEM_HUGO_NORM_COUNT file
+  Format: gene_id\tsample1\tsample2\t...\tsampleN
+  
+  Returns:
+    np.ndarray: Sample IDs, shape (N_samples,)
+    Example: ['GTEX-1117F-0226-SM-5GZZ7', 'GTEX-1117F-0426-SM-5EGHI', ...]
+  """
   print(f"Loading samples data from {RSEM_HUGO_NORM_COUNT}")
   with open(RSEM_HUGO_NORM_COUNT, "r") as f:
     samples = f.readline()
     samples = np.asarray(samples.split('\t')[1:])
     return np.char.strip(samples)
 
-# Generates the dict object, used once
 def generate_phenotype_mapping(source_file=GTEX_PHENOTYPE, target_column=1):
+  """
+  Create mapping from sample ID to phenotype (body site).
+  
+  Reads: GTEX_PHENOTYPE file (tab-separated)
+  Format: sample_id\tbody_site\t...
+  
+  Args:
+    source_file: Path to phenotype file
+    target_column: Column index for phenotype (1 = body site)
+    
+  Returns:
+    dict: {sample_id: phenotype}
+    Example: {'GTEX-1117F-0226-SM-5GZZ7': 'Brain - Cortex', ...}
+  """
   print(f"Reading data from {source_file}")
   with open(source_file, "r") as f:
     f.readline()
@@ -90,13 +120,43 @@ def generate_phenotype_mapping(source_file=GTEX_PHENOTYPE, target_column=1):
       _dict[fileds[0].strip()] = fileds[target_column].strip()
     return _dict
 
-# Get phenotypes list from samples and sample_to_phenotype mapping
 def get_phenotypes(samples, sample_to_phenotype):
+  """
+  Map sample IDs to their phenotypes using the phenotype mapping.
+  
+  Args:
+    samples: np.ndarray of sample IDs, shape (N_samples,)
+    sample_to_phenotype: dict mapping sample_id -> phenotype
+    
+  Returns:
+    np.ndarray: Phenotype labels for each sample, shape (N_samples,)
+    Example: ['Brain - Cortex', 'Muscle - Skeletal', 'NA', ...]
+    Note: 'NA' indicates sample not found in phenotype mapping
+  """
   print("Generating phenotypes list from samples and sample mapping")
   return np.vectorize(lambda x: sample_to_phenotype.get(x, "NA"))(samples)
 
 
 def calculate_data():
+  """
+  Load gene expression data and filter out low-expression genes.
+  
+  Reads: RSEM_HUGO_NORM_COUNT file (tab-separated)
+  Format: gene_id\texpr_sample1\texpr_sample2\t...\texpr_sampleN
+  
+  Processing:
+    1. Read each gene (row) with expression values across all samples
+    2. Filter: Keep only genes where mean expression >= 0.1
+    3. Transpose: Convert from (genes, samples) to (samples, genes)
+  
+  Returns:
+    np.ndarray: Gene expression matrix, shape (N_samples, N_filtered_genes)
+    - N_samples: Total number of samples (matches sample IDs from load_samples)
+    - N_filtered_genes: Number of genes passing mean >= 0.1 threshold
+    
+  IMPORTANT: This filters GENES (features), not SAMPLES.
+  The sample dimension is preserved, so phenotype labels remain aligned.
+  """
   print(f"Filling data from {RSEM_HUGO_NORM_COUNT}")
   with open(RSEM_HUGO_NORM_COUNT, "r") as f:
     f.readline()
@@ -114,6 +174,30 @@ def calculate_data():
 
     data = np.asarray(data)
     return data.T
+
+
+def get_y_train(phenotypes):
+  """
+  Convert phenotype labels to one-hot encoded vectors.
+  
+  Args:
+    phenotypes: Array of phenotype labels, shape (N_samples,)
+    Example: ['Brain - Cortex', 'Muscle - Skeletal', ...]
+    
+  Returns:
+    np.ndarray: One-hot encoded labels, shape (N_samples, N_classes)
+    Each row is a binary vector with 1 at the class index.
+  """
+  set_labels = set(phenotypes)
+  num_classes = len(set_labels)
+  dict_labels = {}
+  for i,l in enumerate(set_labels):
+    dict_labels[l] = i
+  labels = []
+  for l in phenotypes:
+    labels.append(dict_labels[l])
+  y_train = to_categorical(labels , num_classes=num_classes)
+  return y_train
 
 
 if __name__ == "__main__":

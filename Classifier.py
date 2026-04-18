@@ -52,7 +52,7 @@ def f1_m(y_true, y_pred):
     recall = recall_m(y_true, y_pred)
     return 2*((precision*recall)/(precision+recall+K.epsilon()))
 
-def get_model():
+def get_model(num_classes):
     model = Sequential()
 
     model.add(Conv2D(32 , kernel_size=15 , strides=2 , padding="same" , input_shape=(128,128,1)))
@@ -85,8 +85,8 @@ def get_model():
 
 def train_model(model, x_train, y_train, x_val, y_val):
     stop_early = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5 ,restore_best_weights=True)
-    hist = model.fit(x_train, y_train, epochs=100, validation_data=(x_val, y_val), callbacks=[stop_early])
-    # hist = model.fit(x_train, y_train, epochs=2, validation_data=(x_val, y_val), callbacks=[stop_early])
+    # hist = model.fit(x_train, y_train, epochs=100, validation_data=(x_val, y_val), callbacks=[stop_early])
+    hist = model.fit(x_train, y_train, epochs=2, validation_data=(x_val, y_val), callbacks=[stop_early])
     return hist
 
 
@@ -114,27 +114,29 @@ def plot_history(hist):
     print(f"Accuracy plot saved to {DATA_DIR}/classifier_accuracy.png")
 
 
-def evaluate_model(model):
+def evaluate_model(model, x_train, y_train, x_val, y_val):
     model.evaluate(x_train, y_train)
     model.evaluate(x_val, y_val)
 
-def save_model(model, file_path=f"{DATA_DIR}/{MODEL_OUTPUT_FILE}"):
-    model.save(file_path)
-    print(f"Model saved to {file_path}")
-    print(f"Feature file: {FEATURE_FILE}")
-    print(f"Label file: {LABEL_FILE}")
+def save_model(model, file_path=f"{DATA_DIR}/{MODEL_OUTPUT_FILE}", weights_only=True):
+    # Save weights only (no optimizer state) - ~467MB instead of ~1.4GB
+    if weights_only:
+        weights_path = file_path.replace('.keras', '_weights_only.keras')
+        model.save(weights_path, save_format='keras', include_optimizer=False)
+        print(f"Model weights saved to {weights_path}")
+    else:
+        model.save(file_path, save_format='keras')
+        print(f"Model saved to {file_path}")
 
 
 if __name__ == "__main__":
     x_train, x_val, y_train, y_val, num_classes = load_data(f"{DATA_DIR}/{FEATURE_FILE}", f"{DATA_DIR}/{LABEL_FILE}")
-    model = get_model()
+    model = get_model(num_classes)
     load_model = False
     if load_model:
         model = tf.keras.models.load_model(f"{DATA_DIR}/{MODEL_OUTPUT_FILE}")
     else:
         hist = train_model(model, x_train, y_train, x_val, y_val)
         save_model(model)
-        plot = True
-        if plot:
-            plot_history(hist)
-    evaluate_model(model)
+        plot_history(hist)
+    evaluate_model(model, x_train, y_train, x_val, y_val)

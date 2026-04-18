@@ -1,33 +1,59 @@
+"""
+Image Preprocessing Pipeline for Gene Expression Data
+
+This module transforms gene expression data into 2D image representations using t-SNE.
+
+TRANSFORMATION PIPELINE:
+1. Apply t-SNE to reduce gene dimensions from N_genes to 2D coordinates
+2. Find minimum bounding rectangle around t-SNE point cloud
+3. Rotate coordinates to align with bounding box axes
+4. Normalize coordinates to start at origin (0,0)
+5. Map gene expressions to 2D images using t-SNE coordinates as pixel locations
+6. Pad/resize images to consistent dimensions (128x128)
+
+KEY CONCEPT:
+- Each gene gets a 2D coordinate from t-SNE (similar genes cluster together)
+- For each sample, create an image where pixel intensity = gene expression
+- Genes with similar expression patterns appear at nearby pixels
+- Result: Gene expression vector → 2D image suitable for CNN classification
+
+FUNCTIONS:
+- get_tsne_data(): Apply t-SNE dimensionality reduction
+- minimum_bounding_rectangle(): Find optimal bounding box
+- rotate(): Rotate 2D points
+- compute_rotation(): Calculate rotation angle
+- initialize_image_data(): Create empty image array
+- create_expression_images_from_tsne(): Core transformation (expression → image)
+- pad_data(): Center-pad images to target size
+- resize_images(): Resize images using interpolation
+"""
+
 import numpy as np
 from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
 from scipy.spatial import ConvexHull
 from scipy.ndimage import zoom
 import math
-from tensorflow.keras.utils import to_categorical
-from preprocess_data import load_if_not_exists, calculate_data, load_samples, generate_phenotype_mapping, get_phenotypes, GTEX_PHENOTYPE
 
 TARGET_SIZE = 128
 
+
 def get_tsne_data(data):
+    """
+    Apply t-SNE dimensionality reduction to map genes to 2D coordinates.
+    
+    Args:
+        data: Gene expression matrix, shape (N_samples, N_genes)
+        
+    Returns:
+        np.ndarray: t-SNE coordinates for each gene, shape (N_genes, 2)
+        Each row represents a gene's 2D position in t-SNE space.
+        Similar genes will have nearby coordinates.
+    """
     tsne = TSNE(n_components=2, verbose=1)
     tsne_results = tsne.fit_transform(data.T)
     print("Finished t-SNE")
     return tsne_results
 
-def plot_tsne(tsne_results):
-    framedata = {"tsne-2d-one": tsne_results[:,0] , "tsne-2d-two": tsne_results[:,1] } 
-    df = pd.DataFrame(framedata)
-    plt.figure(figsize=(16,10))
-    sns.scatterplot(
-        x="tsne-2d-one", y="tsne-2d-two",
-            data=df,
-            legend="full",
-            alpha=0.3
-        )
-    plt.show()
 
 def minimum_bounding_rectangle(points):
     """
@@ -90,39 +116,81 @@ def minimum_bounding_rectangle(points):
     print("Finished minimum bounding rectangle")
 
     return rval
-    
 
-def plot_convex_hull(tsne_results, hull):
-    plt.plot(tsne_results[:,0], tsne_results[:,1], 'o')
-    for simplex in hull.simplices:
-        plt.plot(tsne_results[simplex, 0], tsne_results[simplex, 1], 'k-')
-    plt.show()
-
-def plot_bounding_box(tsne_results, bbox):
-    plt.scatter(tsne_results[:,0], tsne_results[:,1])
-    plt.fill(bbox[:,0], bbox[:,1], alpha=0.2)
-    plt.axis('equal')
-    plt.show()
 
 def rotate(p, origin=(0, 0), theta=0):
-
+    """
+    Rotate 2D points around an origin by angle theta.
+    
+    Args:
+        p: Points to rotate, shape (N, 2)
+        origin: Center of rotation, tuple (x, y)
+        theta: Rotation angle in radians
+        
+    Returns:
+        np.ndarray: Rotated points, shape (N, 2)
+    """
     R = np.array([[np.cos(theta), -np.sin(theta)],
                   [np.sin(theta),  np.cos(theta)]])
     o = np.atleast_2d(origin)
     p = np.atleast_2d(p)
     return np.squeeze((R @ (p.T-o.T) + o.T).T)
 
+
 def compute_rotation(bbox):
+    """
+    Compute rotation angle to align bounding box with axes.
+    
+    Args:
+        bbox: Bounding box corners, shape (4, 2)
+        
+    Returns:
+        float: Rotation angle in radians to align box with x/y axes
+    """
     theta = np.arctan((bbox[0][1]-bbox[1][1])/(bbox[0][0] - bbox[1][0]))
     return -theta
 
+
 def initialize_image_data(sample_gene_expressions, normalized_tsne):
+    """
+    Initialize empty image array based on t-SNE coordinate bounds.
+    
+    Args:
+        sample_gene_expressions: Gene expression matrix, shape (N_samples, N_genes)
+        normalized_tsne: Normalized t-SNE coordinates, shape (N_genes, 2)
+        
+    Returns:
+        tuple: (data, w, h)
+            - data: Empty image array, shape (N_samples, w+1, h+1)
+            - w: Width of image (max x-coordinate)
+            - h: Height of image (max y-coordinate)
+    """
     w , h = np.max(normalized_tsne, axis=0)
     w, h = int(w) , int(h)
     data = np.zeros((sample_gene_expressions.shape[0], w+1, h+1))
     return data, w, h
 
+
 def create_expression_images_from_tsne(sample_gene_expressions, normalized_tsne, data, w, h):
+    """
+    Convert gene expression vectors to 2D images using t-SNE coordinates.
+    
+    For each sample:
+    1. Map each gene's expression value to a pixel at its t-SNE coordinate
+    2. If multiple genes map to same pixel, average their expression values
+    3. Normalize pixel intensities to [0, 1] range
+    
+    Args:
+        sample_gene_expressions: Gene expression matrix, shape (N_samples, N_genes)
+        normalized_tsne: t-SNE coordinates for genes, shape (N_genes, 2)
+        data: Pre-initialized image array, shape (N_samples, w+1, h+1)
+        w: Image width
+        h: Image height
+        
+    Returns:
+        np.ndarray: Expression images, shape (N_samples, w+1, h+1)
+        Pixel values in [0, 1] representing normalized gene expression.
+    """
     # Go through each sample's gene expressions
     for i, profile in enumerate(sample_gene_expressions):
         counts = np.zeros((w+1,h+1))
@@ -144,7 +212,19 @@ def create_expression_images_from_tsne(sample_gene_expressions, normalized_tsne,
     print("Finished create expression images from tsne")
     return data
 
+
 def pad_data(data, pad_size):
+    """
+    Center-pad images to target size with zeros.
+    
+    Args:
+        data: Image array, shape (N_samples, w, h)
+        pad_size: Target size for width and height
+        
+    Returns:
+        np.ndarray: Padded images, shape (N_samples, pad_size, pad_size)
+        If input is larger than pad_size, returns original data with warning.
+    """
     if data.shape[1] > pad_size or data.shape[2] > pad_size:
         print(f"Warning: Data shape {data.shape[1]}x{data.shape[2]} is larger than pad size {pad_size}")
         return data
@@ -155,105 +235,19 @@ def pad_data(data, pad_size):
     data = np.pad(data , [(0,0),(left_padd,right_padd),(top_padd,bottom_padd)], 'constant')
     return data
 
-def get_y_train(phenotypes):
-    set_labels = set(phenotypes)
-    num_classes = len(set_labels)
-    dict_labels = {}
-    for i,l in enumerate(set_labels):
-        dict_labels[l] = i
-    labels = []
-    for l in phenotypes:
-        labels.append(dict_labels[l])
-    y_train = to_categorical(labels , num_classes=num_classes)
-    return y_train
 
 def resize_images(images, target_size=TARGET_SIZE):
-    # images: shape (n_samples, w, h)
+    """
+    Resize images to target dimensions using cubic interpolation.
+    
+    Args:
+        images: Image array, shape (N_samples, w, h)
+        target_size: Target width and height (default: 128)
+        
+    Returns:
+        np.ndarray: Resized images, shape (N_samples, target_size, target_size)
+    """
     n, w, h = images.shape
     zoom_factors = (1, target_size / w, target_size / h)
     resized = zoom(images, zoom_factors, order=3)  # order=3: cubic interpolation
     return resized
-
-# Takes numpy array and renders it as an image
-def render_image(image):
-    plt.imshow(image)
-    plt.show()
-
-# RSEM_HUGO_NORM_COUNT -> TSNE -> BBOX + ROTATE -> NORMALIZE -> PAD + RESIZE
-
-if __name__ == "__main__":
-    sample_gene_expressions = load_if_not_exists("loaded_data/data.npy", calculate_data)
-    tsne_results = load_if_not_exists("loaded_data/tsne_results.npy", 
-    get_tsne_data, 
-    data=sample_gene_expressions)
-    
-    # plot_tsne(tsne_results)
-    bbox = minimum_bounding_rectangle(tsne_results)
-    # plot_bounding_box(tsne_results, bbox)
-    # hull = ConvexHull(tsne_results)
-    # plot_convex_hull(tsne_results, hull)
-
-    theta = compute_rotation(bbox)
-    rotated_tsne = rotate(tsne_results, origin=bbox[0], theta=theta)
-
-    # rotated_bbox = rotate(bbox, origin=bbox[0], theta=theta)
-    # plot_bounding_box(rotated_tsne, rotated_bbox)
-
-    normalized_tsne = rotated_tsne - np.min(rotated_tsne, axis=0)
-
-    data, w, h = initialize_image_data(sample_gene_expressions, normalized_tsne)
-
-    data = load_if_not_exists("loaded_data/unpadded_expressions.npy", create_expression_images_from_tsne, 
-    sample_gene_expressions=sample_gene_expressions,
-    normalized_tsne=normalized_tsne,
-    data=data,
-    w=w,
-    h=h)
-
-    # Images are 148 x 148 so padding doesn't work
-    pad_size = TARGET_SIZE
-    data = pad_data(data, pad_size)
-
-    # Resize larger images to 128x128
-    data = load_if_not_exists("loaded_data/resized_expressions.npy",
-     resize_images,
-     images=data,
-     target_size=TARGET_SIZE)
-
-    samples = load_if_not_exists("loaded_data/samples.npy", load_samples)
-    
-    # Get y_train of primary disease
-    phenotype_mapping = load_if_not_exists("loaded_data/sample_to_body_site_mapping.json", generate_phenotype_mapping)
-    sample_body_site_phenotypes = load_if_not_exists("loaded_data/sample_body_site_phenotypes.npy", 
-        get_phenotypes, 
-        samples=samples, 
-        sample_to_phenotype=phenotype_mapping)
-    y_train_primary_disease_or_tissue =load_if_not_exists("loaded_data/y_primary_disease_or_tissue.npy",
-        get_y_train,
-        phenotypes=sample_body_site_phenotypes)
-
-    # Get y_train of primary site
-    primary_site_mapping = load_if_not_exists("loaded_data/primary_site_mapping.json", 
-        generate_phenotype_mapping, 
-        source_file=GTEX_PHENOTYPE, 
-        target_column=2)
-    sample_primary_site_phenotypes = load_if_not_exists("loaded_data/sample_primary_site_phenotypes.npy",
-        get_phenotypes,
-        samples=samples,
-        sample_to_phenotype=primary_site_mapping)
-    y_train_primary_site =load_if_not_exists("loaded_data/y_primary_site.npy",
-        get_y_train,
-        phenotypes=sample_primary_site_phenotypes)
-
-    print()
-    # Get dimensions and total counts
-    # Confirm with professor.
-
-
-    # Get dimensions and total counts
-    # Confirm with professor.
-
-    
-
-    
-

@@ -25,3 +25,4 @@ gtex_gene_expected_count
 
 # Model files
 *.keras
+*.h5
