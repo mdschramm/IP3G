@@ -1,0 +1,25 @@
+# Uses contents of Dockerfile to build image and push to directory in artifact registry
+substitutions:
+  _HOST: us-east1-docker.pkg.dev
+  _REPO: mark-ip3g-repo
+  _IMAGE: ip3g
+  _TAG: latest
+  _TARGET: runtime # Default to runtime stage, can override with --substitutions=_TARGET=base
+  _USE_REMOTE_BASE: "false" # Set to "true" for fast builds using remote base
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  env:
+    - "DOCKER_BUILDKIT=1" # Enable BuildKit for better caching and parallel builds
+
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    script: |
+      BASE_IMAGE="${_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE}:base"
+      docker build --target ${_TARGET} --build-arg USE_REMOTE_BASE=${_USE_REMOTE_BASE} --build-arg BASE_IMAGE="$BASE_IMAGE" -t ${_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG} .
+    automapSubstitutions: true
+    env:
+      - "DOCKER_BUILDKIT=1"
+
+images:
+  - "${_HOST}/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG}"

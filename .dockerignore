@@ -1,0 +1,28 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Notebooks and their checkpoints
+notebooks/
+*.ipynb_checkpoints/
+
+# Local data and outputs (mounted as volumes at runtime)
+images/
+output/
+
+# Large static raw data files (bind-mount at runtime)
+GTEX_phenotype
+gtex_RSEM_Hugo_norm_count
+gtex_gene_expected_count
+
+# VCS and editor junk
+.git/
+.gitignore
+.gitattributes
+.DS_Store
+
+# Model files
+*.keras
+*.h5

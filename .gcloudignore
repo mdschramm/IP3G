@@ -1,0 +1,32 @@
+# Mirrors .dockerignore — controls what gcloud builds submit uploads to Cloud Build.
+# .dockerignore only applies during the docker build step on Cloud Build's servers;
+# this file controls the local→GCS upload that happens before the build starts.
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Notebooks
+notebooks/
+*.ipynb_checkpoints/
+
+# All local outputs and data — mounted as volumes at runtime, never needed in image
+images/
+output/
+
+# Large static raw data files — bind-mounted at runtime from GCS
+GTEX_phenotype
+gtex_RSEM_Hugo_norm_count
+gtex_gene_expected_count
+
+# VCS and editor junk
+.git/
+.gitignore
+.gitattributes
+.DS_Store
+
+# Model files
+*.keras
+*.h5

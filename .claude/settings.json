@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source gcloud_helpers && gcloud compute ssh mark-test-instance --zone=us-central1-b --command=\"sudo docker logs *)"
+    ]
+  }
+}

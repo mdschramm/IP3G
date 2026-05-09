@@ -1,0 +1,372 @@
+# GCLOUD_PROJECT_NAME="spry-reference-474816-a5"
+GCLOUD_PROJECT_NAME="anita-hunter"
+GCLOUD_MAIN_ACCOUNT="mschramm@gradcenter.cuny.edu"
+GCLOUD_SERVICE_ACCOUNT="309851949944-compute@developer.gserviceaccount.com"
+GCLOUD_REGION_ARTIFACTS="us-east1"
+INSTANCE_NAME="mark-test-instance"
+GCLOUD_ARTIFACTORY_HOST="$GCLOUD_REGION_ARTIFACTS-docker.pkg.dev"
+GCLOUD_REPO="mark-ip3g-repo"
+GCLOUD_IMAGE="ip3g"
+GCLOUD_TAG="latest"
+GCLOUD_INSTANCE_ZONE="us-central1-b"
+# Get this from cat /etc/os-release on VM - look for VERSION_CODENAME; prepend gcsfuse-
+GCSFUSE_REPO="gcsfuse-jammy"  # Ubuntu 22.04 (Jammy Jellyfish)
+GCS_BUCKET_NAME="mark-ip3g-data"
+GCLOUD_MOUNT_POINT="/mnt/gcs/mark-ip3g-data"
+VM_OUTPUT_BASE='$HOME/output'  # single quotes: defers $HOME expansion to VM shell
+USE_GPU=true
+
+NVIDIA_CONTAINER_TOOLKIT_VERSION="1.18.0-1"
+
+
+# ============================================================
+# QUICK REFERENCE — Common workflows (source this file first)
+# ============================================================
+#
+# DEPLOY (after any code change):
+#   push_gcloud_image_fast
+#
+# PREPROCESS (once, or when raw data changes):
+#   enable_permissions_on_output_dir_for_docker
+#   USE_GPU=false CONTAINER_NAME=ip3g-preprocess run_remote_preprocess
+#   CONTAINER_NAME=ip3g-preprocess tail_logs
+#   push_preprocessing_to_gcs
+#
+# TRAIN A MODEL (preprocessing must already be on VM or in GCS):
+#   pull_preprocessing_from_gcs       # skip if already on VM this session
+#   run_remote "diffusion/diffusion_train.py --mode remote"
+#   tail_logs
+#   push_output_to_gcs diffusion      # or: gan, classifier
+#
+# GET RESULTS LOCALLY:
+#   download_output_from_gcs
+#
+# RUN DIAGNOSTICS (after any training or diagnostic run):
+#   run_remote_diagnostics                                                                          # diagnostic checkpoint (default)
+#   run_remote_diagnostics output/diffusion/remote/checkpoints/diffusion_model_step_010000.weights.h5 remote
+#
+# RE-AUTH (if Docker pull fails with "unauthorized" error):
+#   docker_login_remote
+#
+# FIRST-TIME VM SETUP (new VM only):
+#   set_gcloud_project_settings
+#   docker_login_remote
+#   enable_permissions_on_output_dir_for_docker
+#   configure_docker_nvidia           # GPU driver + container toolkit
+# ============================================================
+
+
+# ==============================================================
+# DAY-TO-DAY: build, run, monitor
+# ==============================================================
+
+# Full build: builds base + runtime from scratch (use when dependencies change)
+push_gcloud_image() {
+    echo "Pushing image to gcloud"
+    DOCKER_BUILDKIT=1 gcloud builds submit --region=$GCLOUD_REGION_ARTIFACTS --config cloudbuild.yaml
+}
+
+# Push base image with :base tag (do this once, or when environment.yml changes)
+push_gcloud_base_image() {
+    echo "Pushing base image (dependencies only) to gcloud"
+    DOCKER_BUILDKIT=1 gcloud builds submit --region=$GCLOUD_REGION_ARTIFACTS --config cloudbuild.yaml --substitutions=_TARGET=base,_TAG=base
+}
+
+# Fast build: uses remote base image, only builds runtime layer (use for code changes)
+push_gcloud_image_fast() {
+    echo "Pushing runtime image using remote base (fast mode)"
+    DOCKER_BUILDKIT=1 gcloud builds submit --region=$GCLOUD_REGION_ARTIFACTS --config cloudbuild.yaml --substitutions=_USE_REMOTE_BASE=true
+}
+
+# Run preprocessing container (no GPU, preprocessing output dir writable)
+# Usage: run_remote_preprocess [script_name]
+run_remote_preprocess() {
+    local script="${1:-preprocessing/prepare_training_data.py}"
+    echo "Running preprocessing on $INSTANCE_NAME"
+    local gpu_flag=""
+    if [ "${USE_GPU:-false}" = "true" ]; then gpu_flag="--gpus all"; fi
+    local name="${CONTAINER_NAME:-ip3g}"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm -d --name $name $gpu_flag \
+        -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
+        -v $VM_OUTPUT_BASE/preprocessing:/app/output/preprocessing \
+        $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG $script"
+}
+
+# Run model training container (preprocessing :ro, model output dirs writable, RUN_MODE=remote)
+# Usage: run_remote [script_name]
+# Example: run_remote "diffusion/diffusion_train.py --mode remote"
+run_remote() {
+    local script="${1:-}"
+    echo "Running docker image (detached) on $INSTANCE_NAME"
+    local gpu_flag=""
+    if [ "${USE_GPU:-false}" = "true" ]; then gpu_flag="--gpus all"; fi
+    local name="${CONTAINER_NAME:-ip3g}"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm -d --name $name $gpu_flag \
+        -e RUN_MODE=remote \
+        -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
+        -v $VM_OUTPUT_BASE/preprocessing:/app/output/preprocessing:ro \
+        -v $VM_OUTPUT_BASE/gan/remote:/app/output/gan/remote \
+        -v $VM_OUTPUT_BASE/classifier/remote:/app/output/classifier/remote \
+        -v $VM_OUTPUT_BASE/diffusion/remote:/app/output/diffusion/remote \
+        -v $VM_OUTPUT_BASE/diffusion/diagnostic:/app/output/diffusion/diagnostic \
+        $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG $script"
+}
+
+tail_logs() {
+    local name="${CONTAINER_NAME:-ip3g}"
+    echo "Tailing logs for container $name on $INSTANCE_NAME (Ctrl+C to stop)"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker logs -f --tail 300 $name"
+}
+
+stop_ip3g_container() {
+    local name="${CONTAINER_NAME:-ip3g}"
+    echo "Stopping container $name on $INSTANCE_NAME"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker stop $name || true"
+}
+
+# Force-kill any running containers of this image on the VM
+force_kill_ip3g_containers() {
+    echo "Force-killing containers for image $GCLOUD_IMAGE on $INSTANCE_NAME"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="bash -lc 'ids=\$(sudo docker ps -q --filter ancestor=$GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG); if [ -n \"\$ids\" ]; then sudo docker kill \$ids; else echo \"No running containers matching that image\"; fi'"
+}
+
+# Force-kill all running containers on the VM (use with caution)
+force_kill_all_containers() {
+    echo "Force-killing all running containers on $INSTANCE_NAME"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="bash -lc 'ids=\$(sudo docker ps -q); if [ -n \"\$ids\" ]; then sudo docker kill \$ids; else echo \"No running containers\"; fi'"
+}
+
+
+# ==============================================================
+# DATA SYNC: VM ↔ GCS ↔ local
+# ==============================================================
+
+# Push preprocessing outputs from VM to GCS (run once after preprocessing completes)
+push_preprocessing_to_gcs() {
+    echo "Pushing preprocessing outputs from VM to GCS"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gsutil -m rsync -r $VM_OUTPUT_BASE/preprocessing gs://$GCS_BUCKET_NAME/output/preprocessing"
+    echo "Preprocessing outputs available at gs://$GCS_BUCKET_NAME/output/preprocessing"
+}
+
+# Pull preprocessing outputs from GCS to VM (run before training if preprocessing ran in a prior session)
+pull_preprocessing_from_gcs() {
+    echo "Pulling preprocessing outputs from GCS to VM"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo mkdir -p $VM_OUTPUT_BASE/preprocessing && sudo gsutil -m rsync -r gs://$GCS_BUCKET_NAME/output/preprocessing $VM_OUTPUT_BASE/preprocessing"
+    echo "Preprocessing outputs ready at $VM_OUTPUT_BASE/preprocessing"
+}
+
+# Push model outputs from VM to GCS
+# Usage: push_output_to_gcs [module]
+# Example: push_output_to_gcs diffusion   or   push_output_to_gcs (syncs all)
+push_output_to_gcs() {
+    local module="${1:-}"
+    if [ -n "$module" ]; then
+        echo "Pushing $module/remote outputs to GCS"
+        gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gsutil -m rsync -r $VM_OUTPUT_BASE/$module/remote gs://$GCS_BUCKET_NAME/output/$module/remote"
+    else
+        echo "Pushing all model outputs to GCS"
+        for mod in gan classifier diffusion; do
+            gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gsutil -m rsync -r $VM_OUTPUT_BASE/$mod/remote gs://$GCS_BUCKET_NAME/output/$mod/remote"
+        done
+    fi
+    echo "Outputs at gs://$GCS_BUCKET_NAME/output/"
+}
+
+# Download all outputs from GCS to local ./output/ directory
+download_output_from_gcs() {
+    echo "Downloading outputs from GCS to ./output/"
+    mkdir -p ./output
+    gsutil -m rsync -r gs://$GCS_BUCKET_NAME/output/ ./output/
+    echo "Downloaded to ./output/"
+}
+
+
+# ==============================================================
+# REGISTRY MANAGEMENT
+# ==============================================================
+
+# List all image versions with their tags
+list_registry_images() {
+    gcloud artifacts docker images list $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE --include-tags
+}
+
+# Delete all untagged digests (old layers from superseded pushes)
+prune_untagged_images() {
+    echo "Deleting untagged images from registry..."
+    gcloud artifacts docker images list $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE \
+        --include-tags --format="value(version,tags)" \
+        | awk '$2 == ""' \
+        | awk '{print $1}' \
+        | xargs -I{} gcloud artifacts docker images delete \
+            "$GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE@{}" --quiet --async
+    echo "Done. Untagged images deleted."
+}
+
+
+# ==============================================================
+# ONE-TIME VM SETUP (run once on a new VM)
+# ==============================================================
+
+set_gcloud_project_settings() {
+    gcloud auth login
+    gcloud config set project $GCLOUD_PROJECT_NAME
+    gcloud auth configure-docker $GCLOUD_ARTIFACTORY_HOST
+    gcloud config set account $GCLOUD_MAIN_ACCOUNT
+}
+
+# Re-authenticate Docker on the VM against Artifact Registry (tokens expire ~1hr)
+docker_login_remote() {
+    echo "Re-authenticating Docker on $INSTANCE_NAME"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="gcloud auth print-access-token | sudo docker login -u oauth2accesstoken --password-stdin https://$GCLOUD_ARTIFACTORY_HOST"
+}
+
+enable_permissions_on_output_dir_for_docker() {
+    echo "Creating output directories on $INSTANCE_NAME"
+    for dir in preprocessing gan/remote classifier/remote diffusion/remote diffusion/diagnostic; do
+        gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo mkdir -p $VM_OUTPUT_BASE/$dir"
+    done
+}
+
+install_gcsfuse() {
+    echo "Installing gcsfuse on $INSTANCE_NAME"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="echo \"deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main\" | sudo tee /etc/apt/sources.list.d/gcsfuse.list"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get update && sudo apt-get install -y gcsfuse"
+}
+
+mount_volumes() {
+    echo "Mounting GCS bucket for docker process"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo mkdir -p $GCLOUD_MOUNT_POINT"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gcsfuse $GCS_BUCKET_NAME $GCLOUD_MOUNT_POINT"
+}
+
+# Full VM initialization: install Docker, authenticate, pull image, set up GCS mount
+set_up_docker_image() {
+    echo "Installing dependencies on $INSTANCE_NAME and pulling image"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get update && sudo apt-get install -y docker.io"
+
+    docker_login_command="gcloud auth print-access-token | sudo docker login -u oauth2accesstoken --password-stdin https://$GCLOUD_ARTIFACTORY_HOST"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="$docker_login_command"
+
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker pull $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG"
+
+    install_gcsfuse
+    mount_volumes
+}
+
+# Install NVIDIA GPU driver and CUDA toolkit on VM
+# Steps: https://cloud.google.com/compute/docs/gpus/install-drivers-gpu#no-secure-boot
+# Use mode=binary and branch=prod; also requires manual vulkan install
+install_nvidia_gpu_driver() {
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt update && sudo apt install -y build-essential && sudo apt install -y cmake"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt update && curl -L https://storage.googleapis.com/compute-gpu-installation-us/installer/latest/cuda_installer.pyz --output cuda_installer.pyz"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_driver --installation-mode=binary --installation-branch=prod"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo reboot"
+    sleep 30
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_driver --installation-mode=binary --installation-branch=prod"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt install libvulkan1"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_cuda --installation-mode=binary --installation-branch=prod"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo reboot"
+    sleep 30
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo python3 cuda_installer.pyz install_cuda --installation-mode=binary --installation-branch=prod"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="python3 cuda_installer.pyz verify_cuda"
+}
+
+# Install and configure NVIDIA Container Toolkit on the VM for GPU passthrough
+configure_nvidia_container_toolkit() {
+    echo "Configuring NVIDIA Container Toolkit on $INSTANCE_NAME"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get update && sudo apt-get install -y --no-install-recommends curl gnupg2"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+        && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get update"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo apt-get install -y \
+            nvidia-container-toolkit=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+            nvidia-container-toolkit-base=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+            libnvidia-container-tools=$NVIDIA_CONTAINER_TOOLKIT_VERSION \
+            libnvidia-container1=$NVIDIA_CONTAINER_TOOLKIT_VERSION"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo systemctl restart docker"
+}
+
+# Run both GPU driver install and container toolkit setup
+configure_docker_nvidia() {
+    install_nvidia_gpu_driver
+    configure_nvidia_container_toolkit
+}
+
+
+# ==============================================================
+# LOCAL DEVELOPMENT
+# ==============================================================
+
+# Build locally for testing (much faster than cloud build for iteration)
+build_local() {
+    echo "Building image locally with BuildKit"
+    DOCKER_BUILDKIT=1 docker build -t $GCLOUD_IMAGE:$GCLOUD_TAG .
+}
+
+# Build locally using remote base (fastest for code changes)
+build_local_fast() {
+    echo "Building image locally using remote base (fast mode)"
+    DOCKER_BUILDKIT=1 docker build --build-arg USE_REMOTE_BASE=true -t $GCLOUD_IMAGE:$GCLOUD_TAG .
+}
+
+# Build only base stage locally (for testing dependency changes)
+build_local_base() {
+    echo "Building base image (dependencies only) locally with BuildKit"
+    DOCKER_BUILDKIT=1 docker build --target base -t $GCLOUD_IMAGE:base .
+}
+
+# Run a container in the foreground (no -d, no --rm) to capture crash output
+# Usage: debug_remote_preprocess [script_name]
+debug_remote_preprocess() {
+    local script="${1:-preprocessing/prepare_training_data.py}"
+    echo "Running preprocessing in foreground on $INSTANCE_NAME (output streamed here)"
+    local gpu_flag=""
+    if [ "${USE_GPU:-false}" = "true" ]; then gpu_flag="--gpus all"; fi
+    local name="${CONTAINER_NAME:-ip3g-debug}"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=never --name $name $gpu_flag \
+        -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
+        -v $VM_OUTPUT_BASE/preprocessing:/app/output/preprocessing \
+        $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG $script; \
+        sudo docker rm $name"
+}
+
+# Run diffusion/diagnostics.py on the VM against a saved checkpoint.
+# Streams output directly here (no -d), then deletes all diagnostic outputs except
+# training_history files (model weights are large and no longer needed after analysis).
+# Usage: run_remote_diagnostics [checkpoint_path] [mode]
+# Defaults: final diagnostic checkpoint, mode=diagnostic
+# Examples:
+#   run_remote_diagnostics
+#   run_remote_diagnostics output/diffusion/remote/checkpoints/diffusion_model_final.weights.h5 remote
+run_remote_diagnostics() {
+    local checkpoint="${1:-output/diffusion/diagnostic/checkpoints/diffusion_model_final.weights.h5}"
+    local mode="${2:-diagnostic}"
+    local name="${CONTAINER_NAME:-ip3g-diagnostics}"
+    echo "Running diagnostics on $INSTANCE_NAME"
+    echo "  Checkpoint: $checkpoint"
+    echo "  Mode: $mode"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=never --rm --name $name \
+        -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
+        -v $VM_OUTPUT_BASE/preprocessing:/app/output/preprocessing:ro \
+        -v $VM_OUTPUT_BASE/diffusion/remote:/app/output/diffusion/remote:ro \
+        -v $VM_OUTPUT_BASE/diffusion/diagnostic:/app/output/diffusion/diagnostic:ro \
+        $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG \
+        diffusion/diagnostics.py --checkpoint $checkpoint --mode $mode"
+    echo "Cleaning up diagnostic outputs (keeping training_history files)..."
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="\
+        sudo find $VM_OUTPUT_BASE/diffusion/diagnostic -type f \
+            ! -name 'training_history*.png' \
+            ! -name 'training_history*.npz' \
+            -delete && echo 'Cleanup complete'"
+}
