@@ -43,35 +43,6 @@ def check_lr_schedule(config):
     print("  ✓ Warmup peaks correctly; cosine decays to near-zero")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Min-SNR weight distribution
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_min_snr_weights(config):
-    """Show what timesteps receive reduced weight under Min-SNR-γ."""
-    gamma = config.get('min_snr_gamma', 5)
-    diffusion_utils.init_schedule(config['timesteps'], kind=config['variance_schedule'])
-    ab = diffusion_utils.alpha_cumprod[1:]          # skip t=0
-    snr = ab / np.maximum(1.0 - ab, 1e-8)
-    w   = np.minimum(gamma / snr, 1.0)
-
-    # t where SNR first drops below gamma (weights become 1.0)
-    transition_t = int(np.argmax(snr < gamma)) + 1
-
-    print(f"\n── Min-SNR-{gamma} Weight Distribution ─────────────────────────")
-    for label, lo, hi in [('t <200',   0,   200),
-                           ('200–500', 200,  500),
-                           ('500–800', 500,  800),
-                           ('t >800',  800, config['timesteps'])]:
-        bucket_w = w[lo:hi]
-        print(f"  {label:9s}: mean w = {bucket_w.mean():.3f}   "
-              f"fraction at full weight = {(bucket_w >= 0.999).mean():.0%}")
-
-    pct_full = (snr < gamma).mean()
-    print(f"  Transition (SNR = {gamma}) at t ≈ {transition_t}  "
-          f"→ {pct_full:.0%} of steps receive w = 1.0")
-    print(f"  ✓ High-noise steps (t >{transition_t}) are down-weighted as intended")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. Per-timestep loss breakdown
@@ -267,7 +238,6 @@ if __name__ == '__main__':
     print(f"Loaded {args.checkpoint}  ({model.count_params():,} params)")
 
     check_lr_schedule(config)
-    check_min_snr_weights(config)
     check_timestep_loss(model, X, y, config)
     check_cfg_separation(model, X, y, config)
     if not args.skip_grads:

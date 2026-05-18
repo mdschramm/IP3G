@@ -261,10 +261,11 @@ def prepare_batch_conditional(X, y, num_classes, dropout_rate=0.15):
     }, noise
 
 
-def prepare_dataset_conditional(X, y, num_classes, batch_size=32, dropout_rate=0.15, shuffle=True, drop_remainder=False):
+def prepare_dataset_conditional(X, y, num_classes, batch_size=32, dropout_rate=0.15,
+                                 shuffle=True, drop_remainder=False, excluded_classes=None):
     """
     Create dataset for conditional diffusion training.
-    
+
     Args:
         X: Images array, shape (N, H, W)
         y: One-hot labels array, shape (N, num_classes)
@@ -272,10 +273,23 @@ def prepare_dataset_conditional(X, y, num_classes, batch_size=32, dropout_rate=0
         batch_size: Batch size
         dropout_rate: Classifier-free guidance dropout rate
         shuffle: Whether to shuffle the dataset
-        
+        excluded_classes: Optional list of class indices to exclude from training.
+            Samples whose argmax label matches any excluded class are dropped before
+            the dataset is created. Useful for removing classes with too few samples
+            for stable CFG conditioning.
+
     Returns:
         tf.data.Dataset yielding (inputs_dict, true_noise)
     """
+    if excluded_classes:
+        class_indices = np.argmax(y, axis=-1)
+        keep = np.ones(len(X), dtype=bool)
+        for c in excluded_classes:
+            keep &= (class_indices != c)
+        X = X[keep]
+        y = y[keep]
+        print(f"  Excluded classes {excluded_classes}: {keep.sum():,} / {len(keep):,} samples retained")
+
     ds = tf.data.Dataset.from_tensor_slices((X, y))
     if shuffle:
         ds = ds.shuffle(10_000)

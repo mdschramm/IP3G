@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 import numpy as np
 import os
+from preprocessing.filter_utils import filter_classes
 # import imageio
 # import datetime
 
@@ -19,6 +20,8 @@ IMAGE_SIZE = 128
 EPOCHS = 2000
 RUN_MODE = os.environ.get("RUN_MODE", "local")
 
+EXCLUDED_CLASSES = [6, 24, 25, 31]
+
 PREPROCESSING_DIR = "output/preprocessing"
 DATA_DIR = f"output/gan/{RUN_MODE}"
 GENERATOR_MODEL_FILE = f"{DATA_DIR}/generator.keras"
@@ -29,7 +32,10 @@ Q_NETWORK_MODEL_FILE = f"{DATA_DIR}/q_network.keras"
 def initialize_dataset():
 
     DATA_FILE = f"{PREPROCESSING_DIR}/resized_expressions.npy"
+    LABEL_FILE = f"{PREPROCESSING_DIR}/y_primary_disease_or_tissue.npy"
     x_train = np.load(DATA_FILE)
+    y_train = np.load(LABEL_FILE).astype("float32")
+    x_train, _ = filter_classes(x_train, y_train, EXCLUDED_CLASSES)
 
     # -1 to 1 normalization
     x_train = x_train * 2.0 - 1.0

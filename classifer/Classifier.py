@@ -20,6 +20,7 @@ import numpy as np
 from tensorflow.keras import backend as K
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+from preprocessing.filter_utils import filter_classes, EXCLUDED_CLASSES
 
 RUN_MODE = os.environ.get("RUN_MODE", "local")
 PREPROCESSING_DIR = "output/preprocessing"
@@ -33,6 +34,7 @@ def load_data(feature_file, label_file):
     x_train =np.load(feature_file)
     y_train=np.load(label_file)
     num_classes = y_train.shape[1]
+    x_train, y_train = filter_classes(x_train, y_train, EXCLUDED_CLASSES)
     x_train, x_val, y_train, y_val = train_test_split(x_train, y_train, test_size=0.25, random_state=1)
     return x_train, x_val, y_train, y_val, num_classes
 

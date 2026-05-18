@@ -10,3 +10,4 @@ download data.py
 output/
 legacy/
 evaluation/*.csv
+evaluation/explore/*.png

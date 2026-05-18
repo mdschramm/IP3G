@@ -14,10 +14,14 @@ OUTPUT FILES:
 - output/preprocessing/y_primary_site.npy: (N_samples, N_classes) - Alternative labels
 
 USAGE:
-    python prepare_training_data.py
+    python -m preprocessing.prepare_training_data
 
 The script uses caching (load_if_not_exists) so intermediate results are saved.
 To force recalculation, delete the cached .npy files in output/preprocessing/
+
+NOTE: t-SNE coordinates are uniformly scaled to fit within 127×127 pixels before
+image creation, so pad_data is the only spatial step needed — no interpolation.
+Pixel values are exactly [0, 1] in the output.
 """
 
 import numpy as np
@@ -31,14 +35,13 @@ from preprocessing.preprocess_data import (
     GTEX_PHENOTYPE
 )
 from preprocessing.image_preprocessing import (
-    get_tsne_data, 
-    minimum_bounding_rectangle, 
-    rotate, 
-    compute_rotation, 
-    initialize_image_data, 
-    create_expression_images_from_tsne, 
-    pad_data, 
-    resize_images,
+    get_tsne_data,
+    minimum_bounding_rectangle,
+    rotate,
+    compute_rotation,
+    initialize_image_data,
+    create_expression_images_from_tsne,
+    pad_data,
     TARGET_SIZE
 )
 
@@ -75,11 +78,19 @@ if __name__ == "__main__":
     hull = ConvexHull(tsne_results)
     plot_convex_hull(tsne_results, hull, output_path=f"{OUT}/tsne_convex_hull.png")
 
-    print("\n[4/8] Rotating and normalizing t-SNE coordinates...")
+    print("\n[4/8] Rotating, normalizing, and scaling t-SNE coordinates...")
     theta = compute_rotation(bbox)
     rotated_tsne = rotate(tsne_results, origin=bbox[0], theta=theta)
     normalized_tsne = rotated_tsne - np.min(rotated_tsne, axis=0)
     print(f"Normalized t-SNE range: x=[0, {np.max(normalized_tsne[:,0]):.1f}], y=[0, {np.max(normalized_tsne[:,1]):.1f}]")
+
+    # Scale coordinates uniformly to fit within TARGET_SIZE-1 pixels.
+    # This ensures create_expression_images_from_tsne produces images ≤ TARGET_SIZE×TARGET_SIZE,
+    # so pad_data brings them to exactly TARGET_SIZE×TARGET_SIZE with zero-padding.
+    # No interpolation is needed, preserving the exact [0, 1] pixel range.
+    scale = (TARGET_SIZE - 1) / np.max(normalized_tsne)
+    normalized_tsne = normalized_tsne * scale
+    print(f"  Scaled by {scale:.4f} → coordinates fit within {TARGET_SIZE-1}×{TARGET_SIZE-1} px")
 
     rotated_bbox = rotate(bbox, origin=bbox[0], theta=theta)
     plot_bounding_box(rotated_tsne, rotated_bbox, output_path=f"{OUT}/tsne_rotated_bbox.png")
@@ -97,16 +108,19 @@ if __name__ == "__main__":
         h=h)
     print(f"Expression images shape: {data.shape}")
 
-    print(f"\n[6/8] Padding images to {TARGET_SIZE}x{TARGET_SIZE}...")
+    print(f"\n[6/8] Padding images to {TARGET_SIZE}×{TARGET_SIZE} (final spatial step — no interpolation)...")
     data = pad_data(data, TARGET_SIZE)
 
-    print(f"\n[7/8] Resizing images to {TARGET_SIZE}x{TARGET_SIZE}...")
-    data = load_if_not_exists(f"{OUT}/resized_expressions.npy",
-        resize_images,
-        images=data,
-        target_size=TARGET_SIZE)
-    print(f"Final image shape: {data.shape}")
-    print(f"Pixel value range: [{np.min(data):.4f}, {np.max(data):.4f}]")
+    print(f"\n[7/8] Saving padded images as resized_expressions.npy...")
+    out_path = f"{OUT}/resized_expressions.npy"
+    if not os.path.exists(out_path):
+        np.save(out_path, data)
+        print(f"  Saved: {out_path}")
+    else:
+        data = np.load(out_path)
+        print(f"  Loaded from cache: {out_path}")
+    print(f"  Final image shape: {data.shape}")
+    print(f"  Pixel value range: [{np.min(data):.4f}, {np.max(data):.4f}]  (exact [0,1] — no interpolation)")
 
     render_image(data[0], output_path=f"{OUT}/sample_image_0.png", title="Sample Expression Image 0")
     render_image(data[100], output_path=f"{OUT}/sample_image_100.png", title="Sample Expression Image 100")

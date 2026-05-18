@@ -11,37 +11,37 @@ CONFIG_LOCAL = {
     'in_channels': 1,
     'channels': [64, 128, 256],           # 3 levels (kept small for M2)
     'num_res_blocks': 2,                  # Per resolution
-    'attention_resolutions': [32],        # Bottleneck attention enabled to exercise sparse attn path
+    'attention_resolutions': [16],        # Bottleneck attention enabled to exercise sparse attn path
     'num_heads': 4,                       # For attention layers
     'dropout': 0.1,
     'embedding_dim': 256,                 # Time + class embeddings
     'num_classes': 54,                    # Gene expression classes
+    'excluded_classes': [6, 24, 25, 31],  # Classes with <10 samples — too few for CFG conditioning
     'use_sparse_attention': False,         # Top-k masked attention (sparsity fix)
     'sparse_top_k_frac': 0.5,             # Attend to top 50% of tokens by magnitude
     
     # Training (~2-3 hours on M2)
     'batch_size': 8,                      # M1/M2 memory headroom
-    'learning_rate': 2e-4,
+    'learning_rate': 1e-4,
     'num_steps': 3_000,                   # Enough to validate loss trajectory + early structure
     'save_interval': 500,
     'sample_interval': 500,               # Frequent so we can watch structure emerge
     'log_interval': 50,
-    'ema_decay': 0.995,                   # Lower so EMA tracks fast in short runs
+    'ema_decay': 0.9999,                  # Lower so EMA tracks fast in short runs
     'gradient_clip': 1.0,
     'warmup_steps': 300,                  # Proportional to num_steps
     'mixed_precision': False,             # M2 doesn't benefit much
-    'min_snr_gamma': 5,                   # Min-SNR-γ loss weighting (Hang et al. 2023)
 
     # Diffusion
-    'timesteps': 500,                     # Halved from cosine-default; pairs with linear schedule
-    'variance_schedule': 'linear',        # Better gradient distribution on sparse data
+    'timesteps': 1000,
+    'variance_schedule': 'linear',
     
     # Preprocessing / sampling fixes
     'log_transform': True,                # log1p compression to reduce 55%-zero sparsity dominance
     'eps_threshold': 0.05,                # Soft-threshold predicted noise during sampling
 
     # Classifier-free guidance
-    'dropout_rate': 0.15,                 # 15% unconditional dropout
+    'dropout_rate': 0.10,                 # 15% unconditional dropout
     
     # Data
     'data_dir': 'output/preprocessing',
@@ -56,13 +56,14 @@ CONFIG_REMOTE = {
     # Model architecture
     'image_size': 128,
     'in_channels': 1,
-    'channels': [32, 64, 128, 128],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
-    'num_res_blocks': 2,                  # 2 blocks per level (~6-8M params, ~750-1000 params/image)
-    'attention_resolutions': [16],        # Bottleneck-only attention; 32×32 removed (too expensive, underutilized at 8K samples)
+    'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
+    'num_res_blocks': 3,                  # 2 blocks per level (~6-8M params, ~750-1000 params/image)
+    'attention_resolutions': [32],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
     'num_heads': 4,
     'dropout': 0.1,
-    'embedding_dim': 128,                 # Scaled down with channels
+    'embedding_dim': 256,                 # Scaled down with channels
     'num_classes': 54, # GTEX
+    'excluded_classes': [6, 24, 25, 31],  # Classes with <10 samples — too few for CFG conditioning
     'use_sparse_attention': False,         # Top-k masked attention
     'sparse_top_k_frac': 0.5,
 
@@ -77,18 +78,17 @@ CONFIG_REMOTE = {
     'gradient_clip': 1.0,
     'warmup_steps': 25_000,
     'mixed_precision': True,              # Use FP16 for speed
-    'min_snr_gamma': 5,                   # Min-SNR-γ loss weighting (Hang et al. 2023)
-    
+
     # Diffusion
     'timesteps': 1000,
-    'variance_schedule': 'linear',        # Better for sparse data than cosine
+    'variance_schedule': 'linear',
     
     # Preprocessing / sampling fixes
     'log_transform': True,                # log1p compression
     'eps_threshold': 0.05,                # Soft-threshold predicted noise during sampling
 
     # Classifier-free guidance
-    'dropout_rate': 0.15,
+    'dropout_rate': 0.10,
     
     # Data
     'data_dir': 'output/preprocessing',
@@ -106,28 +106,28 @@ CONFIG_DIAGNOSTIC = {
     # Architecture — identical to remote so results are representative
     'image_size': 128,
     'in_channels': 1,
-    'channels': [32, 64, 128, 128],
-    'num_res_blocks': 2,
-    'attention_resolutions': [16],
+    'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
+    'num_res_blocks': 3,                  # 2 blocks per level (~6-8M params, ~750-1000 params/image)
+    'attention_resolutions': [32],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
     'num_heads': 4,
     'dropout': 0.1,
-    'embedding_dim': 128,
-    'num_classes': 54,
-    'use_sparse_attention': False,
+    'embedding_dim': 256,                 # Scaled down with channels
+    'num_classes': 54, # GTEX
+    'excluded_classes': [6, 24, 25, 31],  # Classes with <10 samples — too few for CFG conditioning
+    'use_sparse_attention': False,         # Top-k masked attention
     'sparse_top_k_frac': 0.5,
 
     # Short training run — no intermediate checkpoints or sample images, only final model
-    'batch_size': 16,
+    'batch_size': 32,
     'learning_rate': 1e-4,
-    'num_steps': 15_000,
+    'num_steps': 10_000,
     'save_interval': 999_999,         # Disabled: only the final save at end of train() fires
-    'sample_interval': 5_000,       # Disabled: samples take time/memory; diagnostics.py handles analysis
-    'log_interval': 25,               # Very frequent — watch loss shape closely
+    'sample_interval': 2_000,       
+    'log_interval': 50,               # Very frequent — watch loss shape closely
     'ema_decay': 0.99,                # Fast EMA for short run
     'gradient_clip': 1.0,
-    'warmup_steps': 100,              # 10% of num_steps (matches local proportion)
+    'warmup_steps': 500,              # 10% of num_steps (matches local proportion)
     'mixed_precision': True,          # Must match remote to catch FP16 issues early
-    'min_snr_gamma': 5,
 
     # Same diffusion settings as remote
     'timesteps': 1000,
@@ -136,7 +136,7 @@ CONFIG_DIAGNOSTIC = {
     'eps_threshold': 0.05,
 
     # CFG
-    'dropout_rate': 0.15,
+    'dropout_rate': 0.1,
 
     # Data
     'data_dir': 'output/preprocessing',

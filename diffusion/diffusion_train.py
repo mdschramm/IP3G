@@ -20,6 +20,7 @@ from datetime import datetime
 from diffusion.diffusion_config import get_config, print_config
 from diffusion.diffusion_model import build_unet
 import diffusion.diffusion_utils as diffusion_utils
+from preprocessing.filter_utils import filter_classes
 
 
 class EMA:
@@ -122,30 +123,15 @@ def get_learning_rate_schedule(base_lr, warmup_steps, total_steps):
 
 
 @tf.function
-def train_step(model, x_noisy, timesteps, class_labels, true_noise, optimizer,
-               alpha_cumprod, gamma=5.0, mixed_precision=False):
-    """Single training step with Min-SNR-γ loss weighting (Hang et al. 2023).
+def train_step(model, x_noisy, timesteps, class_labels, true_noise, optimizer):
+    """Single training step — uniform MSE loss across all timesteps.
 
-    Min-SNR reweights the per-sample loss by min(γ / SNR(t), 1.0) before
-    averaging over the batch. This caps the contribution of high-noise timesteps
-    (which have large raw MSE but carry little class-discriminative signal) and
-    shifts gradient weight toward mid-range timesteps where spatial structure
-    and class differences are encoded.
+    Keras 3 LossScaleOptimizer handles FP16 gradient scaling internally in
+    apply_gradients, so no mixed_precision flag is needed here.
     """
     with tf.GradientTape() as tape:
         predicted_noise = model([x_noisy, timesteps, class_labels], training=True)
-
-        # Per-sample MSE in fp32 — reduce over spatial dims, keep batch dim for weighting
-        raw = tf.square(predicted_noise - tf.cast(true_noise, predicted_noise.dtype))
-        per_sample = tf.reduce_mean(raw, axis=[1, 2, 3])  # [B]
-
-        # Min-SNR-γ weight for ε-prediction: w_t = min(γ / SNR(t), 1.0)
-        ab = tf.cast(tf.gather(alpha_cumprod, timesteps), tf.float32)  # [B]
-        snr = ab / tf.maximum(1.0 - ab, 1e-8)                          # [B]
-        w = tf.minimum(tf.cast(gamma, tf.float32) / snr, 1.0)          # [B]
-
-        loss = tf.reduce_mean(w * per_sample)
-
+        loss = tf.reduce_mean(tf.square(predicted_noise - tf.cast(true_noise, predicted_noise.dtype)))
     gradients = tape.gradient(loss, model.trainable_weights)
     optimizer.apply_gradients(zip(gradients, model.trainable_weights))
     return loss
@@ -264,7 +250,12 @@ def train(config, resume_from=None):
     
     print(f"  Features: {X_train.shape}")
     print(f"  Labels: {y_train.shape}")
-    
+
+    excluded = config.get('excluded_classes', [])
+    if excluded:
+        X_train, y_train = filter_classes(X_train, y_train, excluded)
+        print(f"  Excluded classes {excluded}: {len(X_train)} samples remain")
+
     # Set global normalization constants (and persist them for sampling)
     diffusion_utils.set_data_range(X_train.min(), X_train.max())
     print(f"  Data range: [{diffusion_utils.DATA_MIN:.6f}, {diffusion_utils.DATA_MAX:.6f}]")
@@ -293,9 +284,12 @@ def train(config, resume_from=None):
         dropout_rate=config['dropout_rate'],
         shuffle=True,
         drop_remainder=True,
+        excluded_classes=config.get('excluded_classes', None),
     )
     print(f"  Batch size: {config['batch_size']}")
     print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%")
+    if config.get('excluded_classes'):
+        print(f"  Excluded classes: {config['excluded_classes']}")
 
     # Build model
     print("\n🏗️  Building model...")
@@ -357,10 +351,6 @@ def train(config, resume_from=None):
     step = start_step
     prev_checkpoint_path = None  # track for deletion after next save
 
-    # Pre-compute alpha_cumprod as a constant tensor (shape [T+1]) for Min-SNR weighting
-    alpha_cumprod_t = tf.constant(diffusion_utils.alpha_cumprod, dtype=tf.float32)
-    gamma = float(config.get('min_snr_gamma', 5))
-
     dataset_iter = iter(dataset.repeat())
     
     while step < config['num_steps']:
@@ -375,9 +365,6 @@ def train(config, resume_from=None):
             inputs['class_labels'],
             true_noise,
             optimizer,
-            alpha_cumprod=alpha_cumprod_t,
-            gamma=gamma,
-            mixed_precision=mixed_precision_enabled,
         )
         
         # Update EMA

@@ -7,9 +7,10 @@ TRANSFORMATION PIPELINE:
 1. Apply t-SNE to reduce gene dimensions from N_genes to 2D coordinates
 2. Find minimum bounding rectangle around t-SNE point cloud
 3. Rotate coordinates to align with bounding box axes
-4. Normalize coordinates to start at origin (0,0)
+4. Normalize coordinates to start at origin (0,0), then scale uniformly to fit within 127×127
 5. Map gene expressions to 2D images using t-SNE coordinates as pixel locations
-6. Pad/resize images to consistent dimensions (128x128)
+6. Pad images to consistent dimensions (128×128) — t-SNE coordinates are pre-scaled so
+   padding is the only spatial step needed; no interpolation, pixel values stay exactly [0, 1]
 
 KEY CONCEPT:
 - Each gene gets a 2D coordinate from t-SNE (similar genes cluster together)
@@ -235,7 +236,7 @@ def pad_data(data, pad_size):
     data = np.pad(data , [(0,0),(left_padd,right_padd),(top_padd,bottom_padd)], 'constant')
     return data
 
-
+# unused
 def resize_images(images, target_size=TARGET_SIZE):
     """
     Resize images to target dimensions using cubic interpolation.
