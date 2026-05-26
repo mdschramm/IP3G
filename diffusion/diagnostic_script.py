@@ -14,7 +14,6 @@ X = np.load(f"output/preprocessing/{config['feature_file']}").astype(np.float32)
 y = np.load(f"output/preprocessing/{config['label_file']}").astype(np.float32)
 
 diffusion_utils.set_data_range(X.min(), X.max())
-diffusion_utils.configure_log_transform(X, enable=config.get('log_transform', False))
 diffusion_utils.init_schedule(config['timesteps'], kind=config['variance_schedule'])
 
 model = build_unet(config)

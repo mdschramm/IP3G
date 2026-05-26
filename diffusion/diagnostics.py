@@ -10,13 +10,15 @@ to a full remote run:
 """
 
 import argparse
+import os
+import sys
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 
 from diffusion.diffusion_config import get_config
 from diffusion.diffusion_model import build_unet
-from diffusion.diffusion_train import WarmupCosineSchedule
+from diffusion.diffusion_train import WarmupCosineSchedule, WarmupFlatSchedule, get_learning_rate_schedule
 import diffusion.diffusion_utils as diffusion_utils
 
 
@@ -25,22 +27,31 @@ import diffusion.diffusion_utils as diffusion_utils
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_lr_schedule(config):
-    """Verify the warmup/cosine schedule produces expected values."""
-    s = WarmupCosineSchedule(config['learning_rate'], config['warmup_steps'], config['num_steps'])
+    """Verify the LR schedule produces expected values."""
+    kind = config.get('lr_schedule', 'cosine')
+    s = get_learning_rate_schedule(
+        config['learning_rate'], config['warmup_steps'], config['num_steps'],
+        schedule_kind=kind,
+    )
     w = config['warmup_steps']
     T = config['num_steps']
 
     key = [0, w // 4, w // 2, w, int(T * 0.25), int(T * 0.5), int(T * 0.75), T]
-    print("\n── LR Schedule ──────────────────────────────────────────────────")
+    print(f"\n── LR Schedule ({kind}) ──────────────────────────────────────────")
     for step in key:
-        tag = f"(warmup end)" if step == w else ""
+        tag = "(warmup end)" if step == w else ""
         print(f"  step {step:6d}: {float(s(step)):.3e}  {tag}")
 
     assert abs(float(s(w)) - config['learning_rate']) < 1e-9, \
         f"LR at warmup end should equal base_lr, got {float(s(w)):.3e}"
-    assert float(s(T)) < config['learning_rate'] * 0.01, \
-        f"LR at end should be ~0, got {float(s(T)):.3e}"
-    print("  ✓ Warmup peaks correctly; cosine decays to near-zero")
+    if kind == 'flat':
+        assert abs(float(s(T)) - config['learning_rate']) < 1e-9, \
+            f"Flat schedule: LR at end should equal base_lr, got {float(s(T)):.3e}"
+        print("  ✓ Warmup peaks correctly; LR stays flat")
+    else:
+        assert float(s(T)) < config['learning_rate'] * 0.01, \
+            f"LR at end should be ~0, got {float(s(T)):.3e}"
+        print("  ✓ Warmup peaks correctly; cosine decays to near-zero")
 
 
 
@@ -215,23 +226,102 @@ def check_gradient_norms(model, X, y, config):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6. Magnitude history plotting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_diag_history(path):
+    """Load a magnitude diagnostic .npz (saved by _save_diag_history) into a nested dict."""
+    data = np.load(path)
+    result = {'steps': data['steps'], 'weight_mean': {}, 'weight_max': {}, 'act_mean': {}, 'act_std': {}}
+    prefix_map = {'wmean': 'weight_mean', 'wmax': 'weight_max', 'amean': 'act_mean', 'astd': 'act_std'}
+    for key in data.files:
+        if key == 'steps':
+            continue
+        prefix, name = key.split('__', 1)
+        if prefix in prefix_map:
+            result[prefix_map[prefix]][name] = data[key]
+    return result
+
+
+def plot_magnitude_history(diag_file, output_path=None):
+    """Plot weight and activation magnitude trajectories from a diagnostic .npz file.
+
+    Usage:
+        python -m diffusion.diagnostics --plot-magnitudes path/to/diffusion_local_*_magnitudes.npz
+
+    Args:
+        diag_file: Path to the .npz file produced during training.
+        output_path: Where to save the PNG. Defaults to <diag_file>.png alongside the input.
+
+    Returns:
+        output_path: Path where the plot was saved.
+    """
+    hist = load_diag_history(diag_file)
+    steps = hist['steps']
+    has_acts = bool(hist['act_mean'])
+
+    n_rows = 2 if has_acts else 1
+    fig, axes = plt.subplots(n_rows, 1, figsize=(14, 5 * n_rows), squeeze=False)
+
+    # Weight magnitudes per layer group
+    ax = axes[0, 0]
+    for layer_name in sorted(hist['weight_mean']):
+        ax.plot(steps, hist['weight_mean'][layer_name], label=layer_name, alpha=0.75)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Mean |w|')
+    ax.set_title('Weight Magnitudes Per Layer Group')
+    ax.legend(fontsize=6, ncol=4, loc='upper left')
+    ax.grid(True, alpha=0.3)
+
+    # Activation magnitudes per probed layer
+    if has_acts:
+        ax = axes[1, 0]
+        for layer_name in sorted(hist['act_mean']):
+            ax.plot(steps, hist['act_mean'][layer_name], label=layer_name, alpha=0.75)
+        ax.set_xlabel('Step')
+        ax.set_ylabel('Mean |activation|')
+        ax.set_title('Activation Magnitudes (ResNet/Attention outputs)')
+        ax.legend(fontsize=6, ncol=4, loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(f'Magnitude History — {os.path.basename(diag_file)}', fontsize=11)
+    plt.tight_layout()
+
+    if output_path is None:
+        output_path = diag_file.replace('.npz', '_plot.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved magnitude plot to {output_path}")
+    return output_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Early-training DDPM diagnostics')
-    parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--checkpoint', default=None,
+                        help='Model checkpoint (.weights.h5) to analyse')
     parser.add_argument('--mode', choices=['local', 'remote', 'diagnostic'], default='local')
     parser.add_argument('--skip-grads', action='store_true',
                         help='Skip gradient check (faster, avoids Metal OOM on large model)')
+    parser.add_argument('--plot-magnitudes', metavar='DIAG_NPZ', default=None,
+                        help='Plot weight/activation magnitude history from a diagnostic .npz and exit')
     args = parser.parse_args()
+
+    if args.plot_magnitudes:
+        plot_magnitude_history(args.plot_magnitudes)
+        sys.exit(0)
+
+    if not args.checkpoint:
+        parser.error('--checkpoint is required unless --plot-magnitudes is used')
 
     config = get_config(args.mode)
     X = np.load(f"output/preprocessing/{config['feature_file']}").astype(np.float32)
     y = np.load(f"output/preprocessing/{config['label_file']}").astype(np.float32)
 
     diffusion_utils.set_data_range(X.min(), X.max())
-    diffusion_utils.configure_log_transform(X, enable=config.get('log_transform', False))
 
     model = build_unet(config)
     model.load_weights(args.checkpoint)

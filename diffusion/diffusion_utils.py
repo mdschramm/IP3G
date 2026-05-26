@@ -7,11 +7,6 @@ import tensorflow as tf
 # Global normalization constants (computed from full dataset)
 DATA_MIN = None
 DATA_MAX = None
-# Optional log-space normalization constants (used when USE_LOG_TRANSFORM is True).
-# Computed on log1p(X - DATA_MIN) so they capture the post-log range.
-LOG_MIN = None
-LOG_MAX = None
-USE_LOG_TRANSFORM = False
 
 # Global variance schedule state (populated by init_schedule)
 T = None
@@ -47,90 +42,37 @@ def set_data_range(data_min, data_max):
     DATA_MAX = float(data_max)
 
 
-def set_log_range(log_min, log_max):
-    """Set the global log-space range used by the log1p forward/inverse transform."""
-    global LOG_MIN, LOG_MAX
-    LOG_MIN = float(log_min)
-    LOG_MAX = float(log_max)
-
-
-def configure_log_transform(X, enable=True):
-    """Compute and cache log-space min/max from raw data X (numpy array).
-
-    Pairs with `set_data_range` — DATA_MIN must already reflect X.min().
-    Idempotent: safe to call multiple times.
-    """
-    global USE_LOG_TRANSFORM
-    USE_LOG_TRANSFORM = bool(enable)
-    if not enable:
-        return
-    if DATA_MIN is None:
-        raise RuntimeError("set_data_range(...) must be called before configure_log_transform.")
-    X_shifted = np.asarray(X, dtype=np.float32) - DATA_MIN
-    X_log = np.log1p(X_shifted)
-    set_log_range(X_log.min(), X_log.max())
-
-
 def save_norm_constants(path):
-    """Persist DATA_MIN / DATA_MAX (and LOG_MIN/LOG_MAX if set) next to a checkpoint."""
+    """Persist DATA_MIN / DATA_MAX next to a checkpoint."""
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
-    payload = {'data_min': DATA_MIN, 'data_max': DATA_MAX}
-    if USE_LOG_TRANSFORM and LOG_MIN is not None and LOG_MAX is not None:
-        payload['log_min'] = LOG_MIN
-        payload['log_max'] = LOG_MAX
-        payload['use_log_transform'] = True
     with open(path, 'w') as f:
-        json.dump(payload, f)
+        json.dump({'data_min': DATA_MIN, 'data_max': DATA_MAX}, f)
 
 
 def load_norm_constants(path):
-    """Load DATA_MIN / DATA_MAX (and optional log constants) saved by save_norm_constants."""
-    global USE_LOG_TRANSFORM
+    """Load DATA_MIN / DATA_MAX saved by save_norm_constants."""
     with open(path, 'r') as f:
         payload = json.load(f)
     set_data_range(payload['data_min'], payload['data_max'])
-    if payload.get('use_log_transform', False) and 'log_min' in payload:
-        set_log_range(payload['log_min'], payload['log_max'])
-        USE_LOG_TRANSFORM = True
-    else:
-        USE_LOG_TRANSFORM = False
     return DATA_MIN, DATA_MAX
 
 
 def forward_transform(X):
-    """Map raw data into the model's training space [-1, 1].
+    """Map raw data to [0, 1] using minmax normalization.
 
-    Uses log1p compression when USE_LOG_TRANSFORM is True, otherwise pure minmax.
     Accepts numpy array or TF tensor; returns a TF tensor.
     """
     X = tf.cast(X, tf.float32)
-    if USE_LOG_TRANSFORM and LOG_MIN is not None and LOG_MAX is not None:
-        # log1p path: shift to non-negative, log1p, minmax to [0,1], scale to [-1,1]
-        X_shifted = X - DATA_MIN
-        X_log = tf.math.log1p(X_shifted)
-        x01 = (X_log - LOG_MIN) / (LOG_MAX - LOG_MIN)
-    else:
-        # Linear path: minmax to [0,1]
-        if DATA_MIN is not None and DATA_MAX is not None:
-            x01 = (X - DATA_MIN) / (DATA_MAX - DATA_MIN)
-        else:
-            x01 = X
-    return x01 * 2.0 - 1.0
+    if DATA_MIN is not None and DATA_MAX is not None:
+        return (X - DATA_MIN) / (DATA_MAX - DATA_MIN)
+    return X
 
 
 def denormalize(x):
-    """Map values from [-1, 1] back to the original data range.
-
-    Inverts the same transform used by `forward_transform`. When USE_LOG_TRANSFORM
-    is True, applies expm1 to undo the log1p compression.
-    """
+    """Map values from [0, 1] back to the original data range."""
+    x01 = tf.cast(x, tf.float32)
     if DATA_MIN is None or DATA_MAX is None:
-        return (x + 1.0) / 2.0  # fallback: [0, 1]
-    x01 = (x + 1.0) / 2.0
-    if USE_LOG_TRANSFORM and LOG_MIN is not None and LOG_MAX is not None:
-        x_log = x01 * (LOG_MAX - LOG_MIN) + LOG_MIN
-        x_shifted = tf.math.expm1(x_log)
-        return x_shifted + DATA_MIN
+        return tf.clip_by_value(x01, 0.0, 1.0)
     return x01 * (DATA_MAX - DATA_MIN) + DATA_MIN
 
 
@@ -170,10 +112,9 @@ def prepare_batch(X):
     """
     X = tf.cast(X[..., tf.newaxis], tf.float32)
     
-    # Normalize to [0, 1] using global min/max, then scale to [-1, 1]
+    # Normalize to [0, 1] using global min/max
     if DATA_MIN is not None and DATA_MAX is not None:
         X = (X - DATA_MIN) / (DATA_MAX - DATA_MIN)  # → [0, 1]
-    X = X * 2 - 1  # → [-1, 1]
     
     X_shape = tf.shape(X)
     t = tf.random.uniform([X_shape[0]], minval=1, maxval=T + 1, dtype=tf.int32)
@@ -210,16 +151,19 @@ def apply_classifier_free_dropout(class_labels, num_classes, dropout_rate=0.15):
     return tf.where(mask, unconditional_token, class_labels)
 
 
-def prepare_batch_conditional(X, y, num_classes, dropout_rate=0.15):
+def prepare_batch_conditional(X, y, num_classes, dropout_rate=0.15, max_timestep=None, min_timestep=1):
     """
     Prepare batch for conditional diffusion training with classifier-free guidance.
-    
+
     Args:
         X: Images, shape (N, H, W)
         y: One-hot encoded labels, shape (N, num_classes)
         num_classes: Total number of classes
         dropout_rate: Classifier-free guidance dropout rate
-        
+        max_timestep: Upper bound for sampled timesteps (inclusive). Defaults to T.
+        min_timestep: Lower bound for sampled timesteps (inclusive). Defaults to 1.
+            Set both to restrict training to a specific noise band [min, max].
+
     Returns:
         Tuple of (inputs_dict, true_noise) where:
         - inputs_dict contains X_noisy, timesteps, class_labels
@@ -234,13 +178,14 @@ def prepare_batch_conditional(X, y, num_classes, dropout_rate=0.15):
     X = tf.cast(X, tf.float32)
     if X.shape.rank == 3:
         X = X[..., tf.newaxis]
-    # Forward transform handles both linear and log1p paths
     X = forward_transform(X)
 
-    # Sample random timesteps
+    # Sample random timesteps within [min_timestep, max_timestep]
     X_shape = tf.shape(X)
     batch_size = X_shape[0]
-    t = tf.random.uniform([batch_size], minval=1, maxval=T + 1, dtype=tf.int32)
+    t_max = max_timestep if max_timestep is not None else T
+    t_min = min_timestep if min_timestep is not None else 1
+    t = tf.random.uniform([batch_size], minval=t_min, maxval=t_max + 1, dtype=tf.int32)
     
     # Forward diffusion process
     alpha_cm = tf.gather(alpha_cumprod, t)
@@ -262,7 +207,8 @@ def prepare_batch_conditional(X, y, num_classes, dropout_rate=0.15):
 
 
 def prepare_dataset_conditional(X, y, num_classes, batch_size=32, dropout_rate=0.15,
-                                 shuffle=True, drop_remainder=False, excluded_classes=None):
+                                 shuffle=True, drop_remainder=False, excluded_classes=None,
+                                 timestep_range=None):
     """
     Create dataset for conditional diffusion training.
 
@@ -274,9 +220,8 @@ def prepare_dataset_conditional(X, y, num_classes, batch_size=32, dropout_rate=0
         dropout_rate: Classifier-free guidance dropout rate
         shuffle: Whether to shuffle the dataset
         excluded_classes: Optional list of class indices to exclude from training.
-            Samples whose argmax label matches any excluded class are dropped before
-            the dataset is created. Useful for removing classes with too few samples
-            for stable CFG conditioning.
+        timestep_range: Optional [t_min, t_max] pair restricting sampled timesteps.
+            Defaults to [1, T] (full schedule). Matches noise_timestep_range in config.
 
     Returns:
         tf.data.Dataset yielding (inputs_dict, true_noise)
@@ -290,13 +235,16 @@ def prepare_dataset_conditional(X, y, num_classes, batch_size=32, dropout_rate=0
         y = y[keep]
         print(f"  Excluded classes {excluded_classes}: {keep.sum():,} / {len(keep):,} samples retained")
 
+    t_min = timestep_range[0] if timestep_range is not None else 1
+    t_max = timestep_range[1] if timestep_range is not None else None
+
     ds = tf.data.Dataset.from_tensor_slices((X, y))
     if shuffle:
         ds = ds.shuffle(10_000)
-    
+
     def map_fn(x, y):
-        return prepare_batch_conditional(x, y, num_classes, dropout_rate)
-    
+        return prepare_batch_conditional(x, y, num_classes, dropout_rate, t_max, t_min)
+
     return ds.batch(batch_size, drop_remainder=drop_remainder).map(
         lambda x, y: map_fn(x, y),
         num_parallel_calls=tf.data.AUTOTUNE
@@ -323,7 +271,6 @@ def prepare_batch_ordinal(X, timesteps):
     if len(X.shape) == 3:
         X = X[..., np.newaxis]
     X = tf.cast(X, tf.float32)
-    # Forward transform (linear or log1p depending on USE_LOG_TRANSFORM)
     X = forward_transform(X)
 
     X_shape = tf.shape(X)
@@ -363,9 +310,6 @@ def visualize_diffusion_process(image, timesteps, output_path="output/preprocess
     # Add noise at each timestep
     noisy_images, _ = prepare_batch_ordinal(batch, timesteps)
     
-    # Convert back from [-1, 1] to [0, 1] for visualization
-    noisy_images = (noisy_images + 1) / 2
-    
     # Create visualization
     n_steps = len(timesteps)
     n_cols = min(5, n_steps)  # Max 5 columns
@@ -402,16 +346,11 @@ def visualize_diffusion_process(image, timesteps, output_path="output/preprocess
 
 
 def _round_trip_test(data_path="output/preprocessing/resized_expressions.npy"):
-    """Validate that forward_transform → denormalize is the identity (within fp32 precision).
-
-    Run BEFORE any training to catch off-by-one bugs in the log1p/expm1 inverse.
-    """
-    print("\n🧪 Running log1p/expm1 round-trip test...")
+    """Validate that forward_transform → denormalize is the identity (within fp32 precision)."""
+    print("\nRunning normalization round-trip test...")
     X_real = np.load(data_path).astype(np.float32)
     set_data_range(X_real.min(), X_real.max())
-    configure_log_transform(X_real, enable=True)
     print(f"  DATA_MIN/MAX: [{DATA_MIN:.6f}, {DATA_MAX:.6f}]")
-    print(f"  LOG_MIN/MAX:  [{LOG_MIN:.6f}, {LOG_MAX:.6f}]")
 
     X_norm = forward_transform(X_real).numpy()
     X_recovered = denormalize(tf.constant(X_norm)).numpy()
@@ -421,9 +360,9 @@ def _round_trip_test(data_path="output/preprocessing/resized_expressions.npy"):
     print(f"  Normalized range: [{nmin:.6f}, {nmax:.6f}]")
     print(f"  Max round-trip error: {err:.2e}")
 
-    assert nmin >= -1.0 - 1e-5 and nmax <= 1.0 + 1e-5, f"normalized out of [-1,1]: [{nmin}, {nmax}]"
+    assert nmin >= 0.0 - 1e-5 and nmax <= 1.0 + 1e-5, f"normalized out of [0,1]: [{nmin}, {nmax}]"
     assert err < 1e-5, f"Round-trip failed: max err = {err:.2e}"
-    print("  ✅ log1p/expm1 round-trip clean")
+    print("  Round-trip clean")
 
 
 if __name__ == "__main__":
@@ -440,7 +379,7 @@ if __name__ == "__main__":
     X_train = np.load("output/preprocessing/resized_expressions.npy")
     print(f"\nLoaded expression images: {X_train.shape}")
     print(f"Data range: [{DATA_MIN:.6f}, {DATA_MAX:.6f}]")
-    print(f"Normalization will map to [0, 1] then [-1, 1]")
+    print(f"Normalization will map to [0, 1]")
     
     # Visualize diffusion process for first 3 samples
     timesteps = list(range(0, 1001, 100))  # [0, 100, 200, ... 1000]

@@ -84,7 +84,7 @@ def sample_ddpm_batch(
         num_steps: Number of diffusion timesteps (must match training schedule).
         image_size: Spatial size of the square image.
         denormalize_output: When True, map samples back to the original data range
-            using ``diffusion_utils.DATA_MIN/DATA_MAX``. Otherwise return values in [-1, 1].
+            using ``diffusion_utils.DATA_MIN/DATA_MAX``. Otherwise return values in [0, 1].
         eps_threshold: Soft-threshold magnitude on predicted noise (0.0 = disabled).
             For sparse data, small values like 0.05 push near-zero predictions to
             exact zero, reducing the residual fog seen in dense generations.
@@ -124,11 +124,10 @@ def sample_ddpm_batch(
             eps_threshold_t,
         )
 
-    x = tf.clip_by_value(x, -1.0, 1.0)
+    x = tf.clip_by_value(x, 0.0, 1.0)  # clipped ReLU: zeros negatives, caps at 1
     if denormalize_output:
         x = diffusion_utils.denormalize(x)
-    else:
-        x = (x + 1.0) / 2.0  # [-1, 1] → [0, 1]
+    # else: already [0, 1]
     return x.numpy()
 
 
@@ -353,8 +352,6 @@ def load_model(config, checkpoint_path):
     if os.path.exists(norm_path):
         diffusion_utils.load_norm_constants(norm_path)
         print(f"  Loaded normalization constants: min={diffusion_utils.DATA_MIN:.6f}, max={diffusion_utils.DATA_MAX:.6f}")
-        if diffusion_utils.USE_LOG_TRANSFORM:
-            print(f"  Log transform active: log_min={diffusion_utils.LOG_MIN:.6f}, log_max={diffusion_utils.LOG_MAX:.6f}")
     else:
         print("  ⚠️  norm_constants.json not found; samples will be returned in [0, 1].")
 

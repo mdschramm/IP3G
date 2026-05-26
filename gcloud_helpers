@@ -3,14 +3,14 @@ GCLOUD_PROJECT_NAME="anita-hunter"
 GCLOUD_MAIN_ACCOUNT="mschramm@gradcenter.cuny.edu"
 GCLOUD_SERVICE_ACCOUNT="309851949944-compute@developer.gserviceaccount.com"
 GCLOUD_REGION_ARTIFACTS="us-east1"
-INSTANCE_NAME="mark-test-instance"
+INSTANCE_NAME="mark-diffusion-test" # check this  for new instance
 GCLOUD_ARTIFACTORY_HOST="$GCLOUD_REGION_ARTIFACTS-docker.pkg.dev"
 GCLOUD_REPO="mark-ip3g-repo"
 GCLOUD_IMAGE="ip3g"
 GCLOUD_TAG="latest"
-GCLOUD_INSTANCE_ZONE="us-central1-b"
+GCLOUD_INSTANCE_ZONE="us-central1-b" # check this  for new instance
 # Get this from cat /etc/os-release on VM - look for VERSION_CODENAME; prepend gcsfuse-
-GCSFUSE_REPO="gcsfuse-jammy"  # Ubuntu 22.04 (Jammy Jellyfish)
+GCSFUSE_REPO="gcsfuse-jammy"  # Ubuntu 22.04 (Jammy Jellyfish) # check this  for new instance
 GCS_BUCKET_NAME="mark-ip3g-data"
 GCLOUD_MOUNT_POINT="/mnt/gcs/mark-ip3g-data"
 VM_OUTPUT_BASE='$HOME/output'  # single quotes: defers $HOME expansion to VM shell
@@ -48,7 +48,7 @@ NVIDIA_CONTAINER_TOOLKIT_VERSION="1.18.0-1"
 # RE-AUTH (if Docker pull fails with "unauthorized" error):
 #   docker_login_remote
 #
-# FIRST-TIME VM SETUP (new VM only):
+# FIRST-TIME VM SETUP (new VM only): *runs on debian 12 bookworm*
 #   set_gcloud_project_settings
 #   docker_login_remote
 #   enable_permissions_on_output_dir_for_docker

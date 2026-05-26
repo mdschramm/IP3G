@@ -470,7 +470,7 @@ if __name__ == "__main__":
     print("Testing U-Net model construction...")
     
     # Test with local config
-    config = get_config('remote')
+    config = get_config('local')
     model = build_unet(config)
     
     print("\n" + "="*60)

@@ -120,10 +120,13 @@ def show_pixel_distribution():
     plt.hist(X_train.flatten(), bins=100)
     plt.savefig('evaluation/explore/pixel_distribution.png')
 
-# show_pixel_distribution()
+show_pixel_distribution()
 
 def show_stats():
     X_train = np.load('output/preprocessing/resized_expressions.npy').astype(np.float32)
+    # Number of 0 valued pixels
+    num_pixels = (X_train == 0).sum()
+    print(f"Number of 0 valued pixels: {num_pixels}")
     # Number of pixels below 0.5
     num_pixels = (X_train < 0.5).sum()
     print(f"Number of pixels below 0.5: {num_pixels}")
@@ -131,4 +134,4 @@ def show_stats():
     num_pixels = (X_train > 0.5).sum()
     print(f"Number of pixels above 0.5: {num_pixels}")
 
-show_stats()
+# show_stats()

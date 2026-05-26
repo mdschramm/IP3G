@@ -14,6 +14,7 @@ import argparse
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
+
 import matplotlib.pyplot as plt
 from datetime import datetime
 
@@ -21,6 +22,7 @@ from diffusion.diffusion_config import get_config, print_config
 from diffusion.diffusion_model import build_unet
 import diffusion.diffusion_utils as diffusion_utils
 from preprocessing.filter_utils import filter_classes
+from diffusion.diffusion_ddim import sample_ddim_batch, noise_to_timestep
 
 
 class EMA:
@@ -117,8 +119,36 @@ class WarmupCosineSchedule(keras.optimizers.schedules.LearningRateSchedule):
         }
 
 
-def get_learning_rate_schedule(base_lr, warmup_steps, total_steps):
-    """Return a Keras `LearningRateSchedule` (warmup + cosine decay)."""
+class WarmupFlatSchedule(keras.optimizers.schedules.LearningRateSchedule):
+    """Linear warmup followed by constant learning rate.
+
+    Preferred for short diagnostic runs: the LR never decays to zero, so any
+    loss plateau reflects genuine model saturation rather than LR→0.
+    """
+
+    def __init__(self, base_lr, warmup_steps, name="WarmupFlatSchedule"):
+        super().__init__()
+        self.base_lr = float(base_lr)
+        self.warmup_steps = int(warmup_steps)
+        self.name = name
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup = tf.cast(self.warmup_steps, tf.float32)
+        warmup_lr = self.base_lr * step / tf.maximum(warmup, 1.0)
+        return tf.where(step < warmup, warmup_lr, self.base_lr)
+
+    def get_config(self):
+        return {"base_lr": self.base_lr, "warmup_steps": self.warmup_steps, "name": self.name}
+
+
+def get_learning_rate_schedule(base_lr, warmup_steps, total_steps, schedule_kind='cosine'):
+    """Return a Keras LearningRateSchedule.
+
+    schedule_kind: 'cosine' (warmup + cosine decay to 0) or 'flat' (warmup + constant).
+    """
+    if schedule_kind == 'flat':
+        return WarmupFlatSchedule(base_lr, warmup_steps)
     return WarmupCosineSchedule(base_lr, warmup_steps, total_steps)
 
 
@@ -137,51 +167,152 @@ def train_step(model, x_noisy, timesteps, class_labels, true_noise, optimizer):
     return loss
 
 
-def generate_samples(model, config, num_samples=16, guidance_scale=3.0, eps_threshold=0.0):
-    """
-    Generate sample images during training for monitoring.
+def _build_probe_model(model):
+    """Build a multi-output Keras model for activation magnitude probing.
 
-    eps_threshold is intentionally not read from config here — checkpoint samples
-    should always use 0.0 so the images reflect actual model state rather than
-    being affected by the threshold suppressing early-stage low-magnitude predictions.
+    Selects all ResNetBlock and attention layer outputs from the functional model.
+    Returns (probe_model, probe_names), or (None, []) if no probe layers found.
     """
-    from diffusion.diffusion_sample import sample_ddpm_batch
+    probe_layers = [
+        (l.name, l.output) for l in model.layers
+        if any(tag in l.name for tag in ('res_net_block', 'self_attention', 'sparse_self_attention'))
+    ]
+    if not probe_layers:
+        return None, []
+    names = [n for n, _ in probe_layers]
+    outputs = [o for _, o in probe_layers]
+    probe = keras.Model(inputs=model.inputs, outputs=outputs, name='probe')
+    return probe, names
 
+
+def _collect_diag_step(model, probe_model, probe_names, x_noisy, timesteps, class_labels):
+    """Compute per-layer weight and activation magnitude stats for one batch.
+
+    Returns:
+        w_mean: dict layer_group -> mean |w| (averaged over all weight tensors in group)
+        w_max:  dict layer_group -> max |w|
+        a_mean: dict layer_name -> mean |activation|
+        a_std:  dict layer_name -> std of activation values
+    """
+    # Weight stats — group tensors by parent layer (second path component)
+    weight_groups = {}
+    for w in model.trainable_weights:
+        parts = w.path.split('/')
+        group = parts[1] if len(parts) > 2 else parts[0]
+        abs_w = tf.abs(tf.cast(w, tf.float32))
+        g = weight_groups.setdefault(group, {'sum_mean': 0.0, 'max': 0.0, 'n': 0})
+        g['sum_mean'] += float(tf.reduce_mean(abs_w))
+        g['max'] = max(g['max'], float(tf.reduce_max(abs_w)))
+        g['n'] += 1
+
+    w_mean = {k: v['sum_mean'] / v['n'] for k, v in weight_groups.items()}
+    w_max  = {k: v['max'] for k, v in weight_groups.items()}
+
+    # Activation stats from probe model
+    a_mean, a_std = {}, {}
+    if probe_model is not None:
+        acts = probe_model([x_noisy, timesteps, class_labels], training=False)
+        if not isinstance(acts, (list, tuple)):
+            acts = [acts]
+        for name, act in zip(probe_names, acts):
+            act32 = tf.cast(act, tf.float32)
+            a_mean[name] = float(tf.reduce_mean(tf.abs(act32)))
+            a_std[name]  = float(tf.math.reduce_std(act32))
+
+    return w_mean, w_max, a_mean, a_std
+
+
+def _save_diag_history(history, path):
+    """Persist diagnostic history as a flat npz. Keys use '__' as namespace separator."""
+    flat = {'steps': np.array(history['steps'], dtype=np.int32)}
+    for layer, vals in history['weight_mean'].items():
+        flat[f'wmean__{layer}'] = np.array(vals, dtype=np.float32)
+    for layer, vals in history['weight_max'].items():
+        flat[f'wmax__{layer}'] = np.array(vals, dtype=np.float32)
+    for layer, vals in history['act_mean'].items():
+        flat[f'amean__{layer}'] = np.array(vals, dtype=np.float32)
+    for layer, vals in history['act_std'].items():
+        flat[f'astd__{layer}'] = np.array(vals, dtype=np.float32)
+    np.savez(path, **flat)
+
+
+def generate_samples(model, config, X_train, num_samples=16, guidance_scale=3.0):
+    """
+    Generate monitoring samples via DDIM, seeded from real training images.
+
+    Uses fixed seed indices so the grid is comparable across checkpoints.
+    t_start/t_end are taken from config['noise_timestep_range'], ensuring the
+    DDIM distribution matches the training distribution exactly.
+    """
+    ntr = config.get('noise_timestep_range', [1, config['timesteps']])
+    t_start, t_end = ntr[1], ntr[0]
     num_classes = config['num_classes']
     class_labels = (np.arange(num_samples) % num_classes).astype(np.int32)
 
-    samples = sample_ddpm_batch(
+    # Fixed seed images so the monitoring grid is consistent across checkpoints
+    seed_indices = np.arange(num_samples) % len(X_train)
+    seed_images = X_train[seed_indices]  # [N, H, W]
+
+    # Forward-noise the seeds to t_start — same path as sample_ddim_batch uses internally
+    seed_norm = diffusion_utils.forward_transform(seed_images[..., np.newaxis]).numpy()
+    x_noisy, _ = noise_to_timestep(seed_norm, t_start)  # [N, H, W, 1]
+
+    samples = sample_ddim_batch(
         model,
+        x_init=seed_images,
         class_labels=class_labels,
         num_classes=num_classes,
+        t_start=t_start,
+        t_end=t_end,
+        num_steps=20,          # fast for monitoring; increase at inference time
+        eta=0.0,               # deterministic — same seeds → same grid each checkpoint
         guidance_scale=guidance_scale,
-        num_steps=config['timesteps'],
-        image_size=config['image_size'],
-        eps_threshold=eps_threshold,
+        denormalize_output=False,  # keep in [0, 1] for grid display
+        eps_threshold=0.0,
     )
-    return samples[..., 0]  # drop channel dim: [N, H, W]
+    return samples[..., 0], x_noisy[..., 0]  # both [N, H, W]
 
 
-def save_sample_grid(samples, step, output_dir, run_id=''):
-    """Save grid of generated samples."""
+def save_sample_grid(samples, step, output_dir, run_id='', seed_images=None):
+    """Save grid of generated samples, optionally with seed images interleaved for comparison.
+
+    When seed_images is provided, rows alternate: seeds then generated for each group of 4,
+    making it easy to compare a seed image with its denoised output directly below it.
+    """
     n_samples = len(samples)
     n_cols = 4
-    n_rows = (n_samples + n_cols - 1) // n_cols
+    sample_rows = (n_samples + n_cols - 1) // n_cols
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 3 * n_rows))
-    if n_rows == 1:
-        axes = axes.reshape(1, -1)
+    if seed_images is not None:
+        # Interleaved: for each group of n_cols, seeds row then generated row
+        fig, axes = plt.subplots(sample_rows * 2, n_cols, figsize=(12, 6 * sample_rows))
+        axes = axes.reshape(sample_rows * 2, n_cols)
 
-    for idx, sample in enumerate(samples):
-        row = idx // n_cols
-        col = idx % n_cols
-        ax = axes[row, col]
-        ax.imshow(sample, cmap='viridis')
-        ax.set_title(f'Class {idx}', fontsize=10)
-        ax.axis('off')
+        for idx in range(n_samples):
+            seed_row = (idx // n_cols) * 2
+            col = idx % n_cols
+            axes[seed_row, col].imshow(seed_images[idx], cmap='viridis')
+            axes[seed_row, col].set_title(f'Seed {idx}', fontsize=9)
+            axes[seed_row, col].axis('off')
+            axes[seed_row + 1, col].imshow(samples[idx], cmap='viridis')
+            axes[seed_row + 1, col].set_title(f'Gen {idx}', fontsize=9)
+            axes[seed_row + 1, col].axis('off')
 
-    for idx in range(n_samples, n_rows * n_cols):
-        axes[idx // n_cols][idx % n_cols].axis('off')
+        for idx in range(n_samples, sample_rows * n_cols):
+            seed_row = (idx // n_cols) * 2
+            axes[seed_row, idx % n_cols].axis('off')
+            axes[seed_row + 1, idx % n_cols].axis('off')
+    else:
+        fig, axes = plt.subplots(sample_rows, n_cols, figsize=(12, 3 * sample_rows))
+        axes = axes.reshape(sample_rows, n_cols)
+
+        for idx, sample in enumerate(samples):
+            axes[idx // n_cols, idx % n_cols].imshow(sample, cmap='viridis')
+            axes[idx // n_cols, idx % n_cols].set_title(f'Class {idx}', fontsize=10)
+            axes[idx // n_cols, idx % n_cols].axis('off')
+
+        for idx in range(n_samples, sample_rows * n_cols):
+            axes[idx // n_cols, idx % n_cols].axis('off')
 
     plt.suptitle(f'Generated Samples at Step {step}', fontsize=14)
     plt.tight_layout()
@@ -190,7 +321,7 @@ def save_sample_grid(samples, step, output_dir, run_id=''):
     output_path = os.path.join(output_dir, f'samples_step_{step:06d}{suffix}.png')
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
-    
+
     print(f"  Saved samples to {output_path}")
 
 
@@ -260,11 +391,6 @@ def train(config, resume_from=None):
     diffusion_utils.set_data_range(X_train.min(), X_train.max())
     print(f"  Data range: [{diffusion_utils.DATA_MIN:.6f}, {diffusion_utils.DATA_MAX:.6f}]")
 
-    # Optional log1p preprocessing (compresses sparse / heavy-tailed distributions)
-    if config.get('log_transform', False):
-        diffusion_utils.configure_log_transform(X_train, enable=True)
-        print(f"  Log range:  [{diffusion_utils.LOG_MIN:.6f}, {diffusion_utils.LOG_MAX:.6f}] (log1p enabled)")
-
     norm_path = os.path.join(config['checkpoint_dir'], 'norm_constants.json')
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
     diffusion_utils.save_norm_constants(norm_path)
@@ -285,11 +411,15 @@ def train(config, resume_from=None):
         shuffle=True,
         drop_remainder=True,
         excluded_classes=config.get('excluded_classes', None),
+        timestep_range=config.get('noise_timestep_range', None),
     )
     print(f"  Batch size: {config['batch_size']}")
     print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%")
     if config.get('excluded_classes'):
         print(f"  Excluded classes: {config['excluded_classes']}")
+    if config.get('noise_timestep_range'):
+        ntr = config['noise_timestep_range']
+        print(f"  Noise timestep range: [{ntr[0]}, {ntr[1]}] (training on t ∈ [{ntr[0]}, {ntr[1]}])")
 
     # Build model
     print("\n🏗️  Building model...")
@@ -300,7 +430,8 @@ def train(config, resume_from=None):
     lr_schedule = get_learning_rate_schedule(
         config['learning_rate'],
         config['warmup_steps'],
-        config['num_steps']
+        config['num_steps'],
+        schedule_kind=config.get('lr_schedule', 'cosine'),
     )
     optimizer = keras.optimizers.AdamW(
         learning_rate=lr_schedule,
@@ -315,7 +446,22 @@ def train(config, resume_from=None):
 
     # Create EMA
     ema = EMA(model, decay=config['ema_decay'])
-    
+
+    # Diagnostic setup — probe model for activation magnitudes
+    diag_interval = config.get('diag_interval', 999_999)
+    probe_model, probe_names = _build_probe_model(model)
+    ckpt_dir = config['checkpoint_dir']
+    if 'diagnostic' in ckpt_dir:
+        diag_prefix = 'diffusion_diagnose_'
+    elif 'local' in ckpt_dir:
+        diag_prefix = 'diffusion_local_'
+    else:
+        diag_prefix = 'diffusion_'
+    diag_path = os.path.join(ckpt_dir, f'{diag_prefix}{run_id}_magnitudes.npz')
+    diag_history = {'steps': [], 'weight_mean': {}, 'weight_max': {}, 'act_mean': {}, 'act_std': {}}
+    if diag_interval < 999_999:
+        print(f"  Diagnostic magnitude logging every {diag_interval} steps → {diag_path}")
+
     # Resume from checkpoint if specified
     start_step = 0
     if resume_from:
@@ -369,13 +515,33 @@ def train(config, resume_from=None):
         
         # Update EMA
         ema.update()
-        
+
+        # Magnitude diagnostics
+        if step % diag_interval == 0:
+            w_mean, w_max, a_mean, a_std = _collect_diag_step(
+                model, probe_model, probe_names,
+                inputs['X_noisy'], inputs['timesteps'], inputs['class_labels'],
+            )
+            diag_history['steps'].append(step)
+            for k, v in w_mean.items():
+                diag_history['weight_mean'].setdefault(k, []).append(v)
+            for k, v in w_max.items():
+                diag_history['weight_max'].setdefault(k, []).append(v)
+            for k, v in a_mean.items():
+                diag_history['act_mean'].setdefault(k, []).append(v)
+            for k, v in a_std.items():
+                diag_history['act_std'].setdefault(k, []).append(v)
+            _save_diag_history(diag_history, diag_path)
+            all_wm = list(w_mean.values())
+            all_am = list(a_mean.values()) if a_mean else [float('nan')]
+            print(f"  [diag] mean_|w|={np.mean(all_wm):.4f}  max_|w|={max(w_max.values()):.4f}  mean_|act|={np.mean(all_am):.4f}")
+
         # Track metrics
         losses.append(float(loss))
         lrs.append(float(lr_schedule(step)))
-        
+
         step += 1
-        
+
         # Logging
         if step % config['log_interval'] == 0:
             print(f"Step {step:6d}/{config['num_steps']:6d} | Loss: {loss:.6f} | LR: {lrs[-1]:.6f}")
@@ -403,8 +569,8 @@ def train(config, resume_from=None):
         if step % config['sample_interval'] == 0:
             print(f"  🎨 Generating samples...")
             ema.apply()  # Use EMA weights for generation
-            samples = generate_samples(model, config, num_samples=16, guidance_scale=3.0)
-            save_sample_grid(samples, step, config['sample_dir'], run_id=run_id)
+            samples, seed_imgs = generate_samples(model, config, X_train, num_samples=16, guidance_scale=3.0)
+            save_sample_grid(samples, step, config['sample_dir'], run_id=run_id, seed_images=seed_imgs)
             ema.restore()  # Restore training weights
     
     # Final save
@@ -426,6 +592,11 @@ def train(config, resume_from=None):
     plot_path = os.path.join(config['checkpoint_dir'], 'training_history.png')
     plot_training_history(losses, lrs, plot_path)
     print(f"  📊 Saved training history: {history_path}")
+
+    # Final magnitude diagnostic flush
+    if diag_history['steps']:
+        _save_diag_history(diag_history, diag_path)
+        print(f"  📊 Saved magnitude history: {diag_path}")
     
     print(f"\n📈 Final loss: {losses[-1]:.6f}")
     print(f"📈 Average loss (last 1000 steps): {np.mean(losses[-1000:]):.6f}")

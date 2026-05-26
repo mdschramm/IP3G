@@ -26,7 +26,6 @@ FUNCTIONS:
 - initialize_image_data(): Create empty image array
 - create_expression_images_from_tsne(): Core transformation (expression → image)
 - pad_data(): Center-pad images to target size
-- resize_images(): Resize images using interpolation
 """
 
 import numpy as np
@@ -237,18 +236,18 @@ def pad_data(data, pad_size):
     return data
 
 # unused
-def resize_images(images, target_size=TARGET_SIZE):
-    """
-    Resize images to target dimensions using cubic interpolation.
+# def resize_images(images, target_size=TARGET_SIZE):
+#     """
+#     Resize images to target dimensions using cubic interpolation.
     
-    Args:
-        images: Image array, shape (N_samples, w, h)
-        target_size: Target width and height (default: 128)
+#     Args:
+#         images: Image array, shape (N_samples, w, h)
+#         target_size: Target width and height (default: 128)
         
-    Returns:
-        np.ndarray: Resized images, shape (N_samples, target_size, target_size)
-    """
-    n, w, h = images.shape
-    zoom_factors = (1, target_size / w, target_size / h)
-    resized = zoom(images, zoom_factors, order=3)  # order=3: cubic interpolation
-    return resized
+#     Returns:
+#         np.ndarray: Resized images, shape (N_samples, target_size, target_size)
+#     """
+#     n, w, h = images.shape
+#     zoom_factors = (1, target_size / w, target_size / h)
+#     resized = zoom(images, zoom_factors, order=3)  # order=3: cubic interpolation
+#     return resized

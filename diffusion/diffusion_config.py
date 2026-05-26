@@ -9,9 +9,9 @@ CONFIG_LOCAL = {
     # Model architecture
     'image_size': 128,
     'in_channels': 1,
-    'channels': [64, 128, 256],           # 3 levels (kept small for M2)
+    'channels': [32, 64, 128],           # 3 levels (kept small for M2)
     'num_res_blocks': 2,                  # Per resolution
-    'attention_resolutions': [16],        # Bottleneck attention enabled to exercise sparse attn path
+    'attention_resolutions': [],        # Bottleneck attention enabled to exercise sparse attn path
     'num_heads': 4,                       # For attention layers
     'dropout': 0.1,
     'embedding_dim': 256,                 # Time + class embeddings
@@ -23,21 +23,23 @@ CONFIG_LOCAL = {
     # Training (~2-3 hours on M2)
     'batch_size': 8,                      # M1/M2 memory headroom
     'learning_rate': 1e-4,
-    'num_steps': 3_000,                   # Enough to validate loss trajectory + early structure
-    'save_interval': 500,
-    'sample_interval': 500,               # Frequent so we can watch structure emerge
-    'log_interval': 50,
-    'ema_decay': 0.9999,                  # Lower so EMA tracks fast in short runs
+    'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0
+    'num_steps': 700,                   # Enough to validate loss trajectory + early structure
+    'save_interval': 999999,
+    'sample_interval': 250,               # Frequent so we can watch structure emerge
+    'log_interval': 1,
+    'diag_interval': 20,                  # Weight/activation magnitude logging interval
+    'ema_decay': 0.99,                  # Lower so EMA tracks fast in short runs
     'gradient_clip': 1.0,
-    'warmup_steps': 300,                  # Proportional to num_steps
+    'warmup_steps': 50,                  # Proportional to num_steps
     'mixed_precision': False,             # M2 doesn't benefit much
 
     # Diffusion
     'timesteps': 1000,
-    'variance_schedule': 'linear',
-    
+    'variance_schedule': 'cosine',
+    'noise_timestep_range': [200, 400],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
+
     # Preprocessing / sampling fixes
-    'log_transform': True,                # log1p compression to reduce 55%-zero sparsity dominance
     'eps_threshold': 0.05,                # Soft-threshold predicted noise during sampling
 
     # Classifier-free guidance
@@ -70,10 +72,12 @@ CONFIG_REMOTE = {
     # Training
     'batch_size': 128,                    # Large batch to reduce gradient variance at low-noise timesteps
     'learning_rate': 1e-4,
+    'lr_schedule': 'cosine',
     'num_steps': 500_000,                  # Longer to let new architecture converge
     'save_interval': 10_000,
     'sample_interval': 5_000,
     'log_interval': 250,
+    'diag_interval': 999_999,             # Disabled for remote — too costly
     'ema_decay': 0.9999,
     'gradient_clip': 1.0,
     'warmup_steps': 25_000,
@@ -81,15 +85,15 @@ CONFIG_REMOTE = {
 
     # Diffusion
     'timesteps': 1000,
-    'variance_schedule': 'linear',
-    
+    'variance_schedule': 'cosine',
+    'noise_timestep_range': [1, 200],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
+
     # Preprocessing / sampling fixes
-    'log_transform': True,                # log1p compression
     'eps_threshold': 0.05,                # Soft-threshold predicted noise during sampling
 
     # Classifier-free guidance
     'dropout_rate': 0.10,
-    
+
     # Data
     'data_dir': 'output/preprocessing',
     'feature_file': 'resized_expressions.npy',
@@ -120,19 +124,21 @@ CONFIG_DIAGNOSTIC = {
     # Short training run — no intermediate checkpoints or sample images, only final model
     'batch_size': 32,
     'learning_rate': 1e-4,
+    'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0
     'num_steps': 10_000,
     'save_interval': 999_999,         # Disabled: only the final save at end of train() fires
-    'sample_interval': 2_000,       
+    'sample_interval': 2_000,
     'log_interval': 50,               # Very frequent — watch loss shape closely
-    'ema_decay': 0.99,                # Fast EMA for short run
+    'diag_interval': 50,              # Weight/activation magnitude logging interval
+    'ema_decay': 0.999,                # Fast EMA for short run
     'gradient_clip': 1.0,
     'warmup_steps': 500,              # 10% of num_steps (matches local proportion)
     'mixed_precision': True,          # Must match remote to catch FP16 issues early
 
     # Same diffusion settings as remote
     'timesteps': 1000,
-    'variance_schedule': 'linear',
-    'log_transform': True,
+    'variance_schedule': 'cosine',
+    'noise_timestep_range': [1, 200],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
     'eps_threshold': 0.05,
 
     # CFG
@@ -183,17 +189,19 @@ def print_config(config):
     
     print("\n🎯 Training:")
     print(f"  Batch size: {config['batch_size']}")
-    print(f"  Learning rate: {config['learning_rate']}")
+    print(f"  Learning rate: {config['learning_rate']}  schedule: {config.get('lr_schedule', 'cosine')}")
     print(f"  Total steps: {config['num_steps']:,}")
     print(f"  Warmup steps: {config['warmup_steps']:,}")
+    print(f"  Diag interval: {config.get('diag_interval', 'disabled')}")
     print(f"  Mixed precision: {config['mixed_precision']}")
     print(f"  EMA decay: {config['ema_decay']}")
     
     print("\n🔀 Diffusion:")
     print(f"  Timesteps: {config['timesteps']}")
     print(f"  Schedule: {config['variance_schedule']}")
+    ntr = config.get('noise_timestep_range', [1, config['timesteps']])
+    print(f"  Noise timestep range: [{ntr[0]}, {ntr[1]}] (training t_min..t_max, DDIM t_end..t_start)")
     print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%")
-    print(f"  Log transform: {config.get('log_transform', False)}")
     print(f"  Sparse attention: {config.get('use_sparse_attention', False)}"
           + (f" (top-{int(config.get('sparse_top_k_frac', 0.5)*100)}%)" if config.get('use_sparse_attention', False) else ""))
     print(f"  Sampling eps threshold: {config.get('eps_threshold', 0.0)}")
