@@ -34,7 +34,8 @@ NVIDIA_CONTAINER_TOOLKIT_VERSION="1.18.0-1"
 #
 # TRAIN A MODEL (preprocessing must already be on VM or in GCS):
 #   pull_preprocessing_from_gcs       # skip if already on VM this session
-#   run_remote "diffusion/diffusion_train.py --mode remote"
+#   run_remote "diffusion/diffusion_train.py --mode remote"      # detached; use tail_logs to follow
+#   run_remote_fg "diffusion/diffusion_train.py --mode diagnostic"  # foreground; output streams here
 #   tail_logs
 #   push_output_to_gcs diffusion      # or: gan, classifier
 #
@@ -104,6 +105,28 @@ run_remote() {
     if [ "${USE_GPU:-false}" = "true" ]; then gpu_flag="--gpus all"; fi
     local name="${CONTAINER_NAME:-ip3g}"
     gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm -d --name $name $gpu_flag \
+        -e RUN_MODE=remote \
+        -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
+        -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
+        -v $VM_OUTPUT_BASE/preprocessing:/app/output/preprocessing:ro \
+        -v $VM_OUTPUT_BASE/gan/remote:/app/output/gan/remote \
+        -v $VM_OUTPUT_BASE/classifier/remote:/app/output/classifier/remote \
+        -v $VM_OUTPUT_BASE/diffusion/remote:/app/output/diffusion/remote \
+        -v $VM_OUTPUT_BASE/diffusion/diagnostic:/app/output/diffusion/diagnostic \
+        $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG $script"
+}
+
+# Foreground version of run_remote — output streams directly here; blocks until done.
+# Use for short runs (diagnostic) or when you want live output without a separate tail_logs.
+# Usage: run_remote_fg "diffusion/diffusion_train.py --mode diagnostic"
+run_remote_fg() {
+    local script="${1:-}"
+    echo "Running docker image (foreground) on $INSTANCE_NAME"
+    local gpu_flag=""
+    if [ "${USE_GPU:-false}" = "true" ]; then gpu_flag="--gpus all"; fi
+    local name="${CONTAINER_NAME:-ip3g}"
+    gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm --name $name $gpu_flag \
         -e RUN_MODE=remote \
         -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
         -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \

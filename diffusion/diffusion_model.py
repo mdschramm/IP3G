@@ -144,10 +144,48 @@ class ResNetBlock(layers.Layer):
         return config
 
 
+class QKNormMultiHeadAttention(layers.MultiHeadAttention):
+    """MultiHeadAttention with LayerNorm applied to Q and K after projection.
+
+    Problem: Q and K projection weights (W_q, W_k) grow in magnitude during
+    training alongside activations. Attention logits scale as M² (Q·Kᵀ / √d),
+    so even modest weight growth produces logits of ~98+, collapsing softmax to
+    a hard argmax and zeroing out gradients through attention (observed at step
+    1600 in diagnostic run: mean activation 4.2 → 23.6, loss 0.09 → 0.248).
+
+    Fix: after Keras projects h → Q and h → K (shape [B, seq_len, heads, head_dim]),
+    normalize each head vector to zero mean, unit variance via LayerNorm(axis=-1).
+    This caps logit magnitude at ~√head_dim regardless of W_q / W_k scale.
+
+    Compute overhead: ~0.6% of attention block FLOPs (LayerNorm is O(seq_len × C),
+    attention scores are O(seq_len² × C)).
+
+    Reference: Zhai et al. 2022, "Scaling Vision Transformers to 22 Billion
+    Parameters" — found QK-norm necessary (not optional) for stable training at scale.
+    """
+
+    def build(self, query_shape, value_shape, key_shape=None):
+        super().build(query_shape, value_shape, key_shape)
+        # Normalize over the per-head key dimension (axis=-1 of the projected
+        # [B, seq_len, num_heads, head_dim] tensors) — one norm per head independently.
+        self._q_layer_norm = layers.LayerNormalization(axis=-1)
+        self._k_layer_norm = layers.LayerNormalization(axis=-1)
+
+    def _compute_attention(self, query, key, value, *args, **kwargs):
+        # query, key shape: [B, seq_len, num_heads, head_dim] (post-projection, pre-scores)
+        # Normalize each head's Q and K to unit variance before computing Q·Kᵀ / √d.
+        # Without this, logits scale as ‖W_q‖·‖W_k‖ (grows quadratically with weight
+        # magnitude), pushing softmax into a hard argmax that freezes attention gradients.
+        # *args/**kwargs: forward-compatible with Keras 3 which passes extra positional args.
+        query = self._q_layer_norm(query)
+        key   = self._k_layer_norm(key)
+        return super()._compute_attention(query, key, value, *args, **kwargs)
+
+
 class SelfAttention(layers.Layer):
     """
     Multi-head self-attention layer.
-    
+
     Allows spatial locations to attend to each other.
     """
     
@@ -158,15 +196,17 @@ class SelfAttention(layers.Layer):
     def build(self, input_shape):
         channels = input_shape[-1]
         self.group_norm = layers.GroupNormalization(groups=min(32, channels))
-        self.attention = layers.MultiHeadAttention(
+        # QKNormMultiHeadAttention applies LayerNorm to Q and K after projection
+        # to prevent attention logit explosion as weight magnitudes grow.
+        self.attention = QKNormMultiHeadAttention(
             num_heads=self.num_heads,
             key_dim=channels // self.num_heads
         )
         super().build(input_shape)
-        
+
     def call(self, x):
         batch, height, width, channels = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
-        
+
         # Normalize
         h = self.group_norm(x)
         

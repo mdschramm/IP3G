@@ -243,15 +243,33 @@ def load_diag_history(path):
     return result
 
 
-def plot_magnitude_history(diag_file, output_path=None):
+def plot_magnitude_history(diag_file, output_path=None, top_n=8, weight_names=None, act_names=None):
     """Plot weight and activation magnitude trajectories from a diagnostic .npz file.
 
+    By default selects the top_n layers by their final recorded magnitude. Pass
+    weight_names / act_names to pin specific layers instead.
+
     Usage:
-        python -m diffusion.diagnostics --plot-magnitudes path/to/diffusion_local_*_magnitudes.npz
+        # Top-8 by default
+        python -m diffusion.diagnostics --plot-magnitudes path/to/magnitudes.npz
+
+        # Top-12
+        python -m diffusion.diagnostics --plot-magnitudes path/to/magnitudes.npz --top-n 12
+
+        # Specific layers
+        python -m diffusion.diagnostics --plot-magnitudes path/to/magnitudes.npz \
+            --weight-names "res_net_block_0,res_net_block_1" \
+            --act-names "res_net_block_2,res_net_block_5"
 
     Args:
         diag_file: Path to the .npz file produced during training.
-        output_path: Where to save the PNG. Defaults to <diag_file>.png alongside the input.
+        output_path: Where to save the PNG. Defaults to <diag_file>_plot.png.
+        top_n: Number of layers to show when no explicit names are given.
+            Selected by highest final magnitude value.
+        weight_names: Comma-separated layer group names to plot, or a list of
+            strings. Overrides top_n selection for weights.
+        act_names: Comma-separated probe layer names to plot, or a list of
+            strings. Overrides top_n selection for activations.
 
     Returns:
         output_path: Path where the plot was saved.
@@ -260,28 +278,43 @@ def plot_magnitude_history(diag_file, output_path=None):
     steps = hist['steps']
     has_acts = bool(hist['act_mean'])
 
-    n_rows = 2 if has_acts else 1
+    # Accept comma-separated strings from CLI
+    if isinstance(weight_names, str):
+        weight_names = [n.strip() for n in weight_names.split(',') if n.strip()]
+    if isinstance(act_names, str):
+        act_names = [n.strip() for n in act_names.split(',') if n.strip()]
+
+    def _top_keys(d, n, names):
+        if names is not None:
+            return [k for k in names if k in d]
+        scored = {k: float(v[-1]) for k, v in d.items() if len(v) > 0}
+        return sorted(scored, key=scored.get, reverse=True)[:n]
+
+    w_keys = _top_keys(hist['weight_mean'], top_n, weight_names)
+    a_keys = _top_keys(hist['act_mean'], top_n, act_names) if has_acts else []
+
+    n_rows = 1 + int(bool(a_keys))
     fig, axes = plt.subplots(n_rows, 1, figsize=(14, 5 * n_rows), squeeze=False)
 
-    # Weight magnitudes per layer group
+    # Weight magnitudes
     ax = axes[0, 0]
-    for layer_name in sorted(hist['weight_mean']):
+    for layer_name in w_keys:
         ax.plot(steps, hist['weight_mean'][layer_name], label=layer_name, alpha=0.75)
     ax.set_xlabel('Step')
     ax.set_ylabel('Mean |w|')
-    ax.set_title('Weight Magnitudes Per Layer Group')
-    ax.legend(fontsize=6, ncol=4, loc='upper left')
+    ax.set_title(f'Weight Magnitudes — top {len(w_keys)} by final magnitude')
+    ax.legend(fontsize=8, ncol=2, loc='upper left')
     ax.grid(True, alpha=0.3)
 
-    # Activation magnitudes per probed layer
-    if has_acts:
+    # Activation magnitudes
+    if a_keys:
         ax = axes[1, 0]
-        for layer_name in sorted(hist['act_mean']):
+        for layer_name in a_keys:
             ax.plot(steps, hist['act_mean'][layer_name], label=layer_name, alpha=0.75)
         ax.set_xlabel('Step')
         ax.set_ylabel('Mean |activation|')
-        ax.set_title('Activation Magnitudes (ResNet/Attention outputs)')
-        ax.legend(fontsize=6, ncol=4, loc='upper left')
+        ax.set_title(f'Activation Magnitudes — top {len(a_keys)} by final magnitude')
+        ax.legend(fontsize=8, ncol=2, loc='upper left')
         ax.grid(True, alpha=0.3)
 
     plt.suptitle(f'Magnitude History — {os.path.basename(diag_file)}', fontsize=11)
@@ -308,10 +341,21 @@ if __name__ == '__main__':
                         help='Skip gradient check (faster, avoids Metal OOM on large model)')
     parser.add_argument('--plot-magnitudes', metavar='DIAG_NPZ', default=None,
                         help='Plot weight/activation magnitude history from a diagnostic .npz and exit')
+    parser.add_argument('--top-n', type=int, default=8, metavar='N',
+                        help='Number of layers to show, ranked by final magnitude (default: 8)')
+    parser.add_argument('--weight-names', default=None, metavar='NAMES',
+                        help='Comma-separated weight group names to plot instead of top-n')
+    parser.add_argument('--act-names', default=None, metavar='NAMES',
+                        help='Comma-separated activation layer names to plot instead of top-n')
     args = parser.parse_args()
 
     if args.plot_magnitudes:
-        plot_magnitude_history(args.plot_magnitudes)
+        plot_magnitude_history(
+            args.plot_magnitudes,
+            top_n=args.top_n,
+            weight_names=args.weight_names,
+            act_names=args.act_names,
+        )
         sys.exit(0)
 
     if not args.checkpoint:

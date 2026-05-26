@@ -22,14 +22,14 @@ CONFIG_LOCAL = {
     
     # Training (~2-3 hours on M2)
     'batch_size': 8,                      # M1/M2 memory headroom
-    'learning_rate': 1e-4,
+    'learning_rate': 5e-5,
     'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0
     'num_steps': 700,                   # Enough to validate loss trajectory + early structure
-    'save_interval': 999999,
+    'save_interval': 999_999,
     'sample_interval': 250,               # Frequent so we can watch structure emerge
     'log_interval': 1,
     'diag_interval': 20,                  # Weight/activation magnitude logging interval
-    'ema_decay': 0.99,                  # Lower so EMA tracks fast in short runs
+    'ema_decay': 0.99,                   # Lower so EMA tracks fast in short runs (rule of thumb rolling averages weights in 1 / (1 - decay))
     'gradient_clip': 1.0,
     'warmup_steps': 50,                  # Proportional to num_steps
     'mixed_precision': False,             # M2 doesn't benefit much
@@ -71,7 +71,7 @@ CONFIG_REMOTE = {
 
     # Training
     'batch_size': 128,                    # Large batch to reduce gradient variance at low-noise timesteps
-    'learning_rate': 1e-4,
+    'learning_rate': 5e-5,
     'lr_schedule': 'cosine',
     'num_steps': 500_000,                  # Longer to let new architecture converge
     'save_interval': 10_000,
@@ -123,14 +123,14 @@ CONFIG_DIAGNOSTIC = {
 
     # Short training run — no intermediate checkpoints or sample images, only final model
     'batch_size': 32,
-    'learning_rate': 1e-4,
-    'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0
+    'learning_rate': 5e-5,
+    'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0. better for short non-convergent runs
     'num_steps': 10_000,
     'save_interval': 999_999,         # Disabled: only the final save at end of train() fires
     'sample_interval': 2_000,
     'log_interval': 50,               # Very frequent — watch loss shape closely
-    'diag_interval': 50,              # Weight/activation magnitude logging interval
-    'ema_decay': 0.999,                # Fast EMA for short run
+    'diag_interval': 200,              # Weight/activation magnitude logging interval
+    'ema_decay': 0.997,                # Fast EMA for short run
     'gradient_clip': 1.0,
     'warmup_steps': 500,              # 10% of num_steps (matches local proportion)
     'mixed_precision': True,          # Must match remote to catch FP16 issues early
@@ -138,7 +138,7 @@ CONFIG_DIAGNOSTIC = {
     # Same diffusion settings as remote
     'timesteps': 1000,
     'variance_schedule': 'cosine',
-    'noise_timestep_range': [1, 200],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
+    'noise_timestep_range': [200, 400],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
     'eps_threshold': 0.05,
 
     # CFG

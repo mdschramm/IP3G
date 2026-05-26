@@ -495,7 +495,8 @@ def train(config, resume_from=None):
     losses = []
     lrs = []
     step = start_step
-    prev_checkpoint_path = None  # track for deletion after next save
+    prev_checkpoint_path = None      # track for deletion after next save
+    prev_diag_checkpoint_path = None # track diag rolling checkpoint for deletion
 
     dataset_iter = iter(dataset.repeat())
     
@@ -532,9 +533,21 @@ def train(config, resume_from=None):
             for k, v in a_std.items():
                 diag_history['act_std'].setdefault(k, []).append(v)
             _save_diag_history(diag_history, diag_path)
+
+            # Save rolling checkpoint so a killed run still has recent weights
+            diag_ckpt = os.path.join(ckpt_dir, f'{diag_prefix}{run_id}_step_{step:06d}.weights.h5')
+            model.save_weights(diag_ckpt)
+            ema.save(diag_ckpt.replace('.weights.h5', '.ema.npz'))
+            if prev_diag_checkpoint_path and os.path.exists(prev_diag_checkpoint_path):
+                os.remove(prev_diag_checkpoint_path)
+                ema_prev = prev_diag_checkpoint_path.replace('.weights.h5', '.ema.npz')
+                if os.path.exists(ema_prev):
+                    os.remove(ema_prev)
+            prev_diag_checkpoint_path = diag_ckpt
+
             all_wm = list(w_mean.values())
             all_am = list(a_mean.values()) if a_mean else [float('nan')]
-            print(f"  [diag] mean_|w|={np.mean(all_wm):.4f}  max_|w|={max(w_max.values()):.4f}  mean_|act|={np.mean(all_am):.4f}")
+            print(f"  [diag] mean_|w|={np.mean(all_wm):.4f}  max_|w|={max(w_max.values()):.4f}  mean_|act|={np.mean(all_am):.4f}  ckpt→{os.path.basename(diag_ckpt)}")
 
         # Track metrics
         losses.append(float(loss))
