@@ -48,8 +48,21 @@ class AdaGN(layers.Layer):
         
     def build(self, input_shape):
         # input_shape is a list: [x_shape, conditioning_shape]
-        self.group_norm = layers.GroupNormalization(groups=self.num_groups)
-        self.scale_shift_mlp = layers.Dense(self.channels * 2)
+        # dtype='float32': GroupNorm computes (x-μ)/σ, which requires precise
+        # subtraction. In FP16, activations >~1000 cause catastrophic cancellation
+        # (FP16 has 3 decimal digits of precision — x-μ loses all signal when
+        # x≈μ≈5000). Once GN stops normalizing, each block doubles rather than
+        # normalizes, driving late-decoder activations exponential. FP32 here is
+        # negligible cost (GN is <0.1% of total FLOPs).
+        self.group_norm = layers.GroupNormalization(groups=self.num_groups, dtype='float32')
+        # Zero-init: scale_raw=0 → scale=1 (passthrough) at init. Forces
+        # conditioning to earn its influence via gradients rather than starting
+        # with random scale. Prevents tanh saturation by keeping scale_raw near
+        # zero unless loss explicitly requires deviation. (DiT adaLN-Zero pattern)
+        self.scale_shift_mlp = layers.Dense(
+            self.channels * 2,
+            kernel_initializer='zeros',
+        )
         super().build(input_shape)
         
     def call(self, inputs):
@@ -60,12 +73,26 @@ class AdaGN(layers.Layer):
         
         # Get scale and shift from conditioning
         scale_shift = self.scale_shift_mlp(conditioning)  # [B, C*2]
-        scale, shift = tf.split(scale_shift, 2, axis=-1)  # Each [B, C]
-        
+        scale_raw, shift = tf.split(scale_shift, 2, axis=-1)  # Each [B, C]
+
+        # Bound scale to (0, 2) via 1 + tanh. Prevents AdaGN scale from growing
+        # unboundedly as W_q/W_k weights increase during training. Without this,
+        # each ResNetBlock multiplies features by an uncapped scale, compounding
+        # exponentially across the 20+ blocks in the decoder (observed: magnitude
+        # 7 → 600 over 600 training steps in diagnostic runs).
+        # scale=1 at init (tanh(0)=0 → passthrough), max=2 when saturated.
+        # Reference: analogous to sigmoid gating in LSTMs and adaLN-Zero in DiT.
+        # Cast to float32 before modulation: group_norm output is float32 (dtype='float32'),
+        # but scale_shift_mlp runs in the global compute dtype (float16 under mixed precision).
+        # Mismatched dtypes cause a Mul op failure; casting to float32 keeps modulation
+        # arithmetic in full precision, matching the GN output.
+        scale = 1.0 + tf.tanh(tf.cast(scale_raw, tf.float32))
+        shift = tf.cast(shift, tf.float32)
+
         # Reshape for broadcasting: [B, C] → [B, 1, 1, C]
         scale = scale[:, None, None, :]
         shift = shift[:, None, None, :]
-        
+
         # Modulate: scale * normalized + shift
         return scale * h + shift
         
@@ -168,8 +195,9 @@ class QKNormMultiHeadAttention(layers.MultiHeadAttention):
         super().build(query_shape, value_shape, key_shape)
         # Normalize over the per-head key dimension (axis=-1 of the projected
         # [B, seq_len, num_heads, head_dim] tensors) — one norm per head independently.
-        self._q_layer_norm = layers.LayerNormalization(axis=-1)
-        self._k_layer_norm = layers.LayerNormalization(axis=-1)
+        # dtype='float32': same FP16 catastrophic cancellation risk as GroupNorm.
+        self._q_layer_norm = layers.LayerNormalization(axis=-1, dtype='float32')
+        self._k_layer_norm = layers.LayerNormalization(axis=-1, dtype='float32')
 
     def _compute_attention(self, query, key, value, *args, **kwargs):
         # query, key shape: [B, seq_len, num_heads, head_dim] (post-projection, pre-scores)
@@ -177,8 +205,13 @@ class QKNormMultiHeadAttention(layers.MultiHeadAttention):
         # Without this, logits scale as ‖W_q‖·‖W_k‖ (grows quadratically with weight
         # magnitude), pushing softmax into a hard argmax that freezes attention gradients.
         # *args/**kwargs: forward-compatible with Keras 3 which passes extra positional args.
-        query = self._q_layer_norm(query)
-        key   = self._k_layer_norm(key)
+        #
+        # LayerNorm is dtype='float32' so its output is float32. Cast back to the
+        # incoming dtype (float16 under mixed precision) so query/key/value are all
+        # consistent when super()._compute_attention runs attn_weights @ value.
+        orig_dtype = query.dtype
+        query = tf.cast(self._q_layer_norm(query), orig_dtype)
+        key   = tf.cast(self._k_layer_norm(key),   orig_dtype)
         return super()._compute_attention(query, key, value, *args, **kwargs)
 
 
@@ -195,7 +228,7 @@ class SelfAttention(layers.Layer):
         
     def build(self, input_shape):
         channels = input_shape[-1]
-        self.group_norm = layers.GroupNormalization(groups=min(32, channels))
+        self.group_norm = layers.GroupNormalization(groups=min(32, channels), dtype='float32')
         # QKNormMultiHeadAttention applies LayerNorm to Q and K after projection
         # to prevent attention logit explosion as weight magnitudes grow.
         self.attention = QKNormMultiHeadAttention(
@@ -207,12 +240,12 @@ class SelfAttention(layers.Layer):
     def call(self, x):
         batch, height, width, channels = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
 
-        # Normalize
-        h = self.group_norm(x)
-        
-        # Reshape to sequence: [B, H, W, C] → [B, H*W, C]
-        h = tf.reshape(h, [batch, height * width, channels])
-        
+        # Normalize in float32, then cast back to compute dtype before attention.
+        # group_norm is dtype='float32'; explicitly casting here (rather than relying on
+        # QKNormMultiHeadAttention.__call__ to auto-cast) keeps this consistent with
+        # SparseSelfAttention and avoids fragile implicit behavior in the MHA subclass.
+        h = tf.cast(tf.reshape(self.group_norm(x), [batch, height * width, channels]), x.dtype)
+
         # Self-attention
         h = self.attention(h, h)
         
@@ -246,7 +279,7 @@ class SparseSelfAttention(layers.Layer):
 
     def build(self, input_shape):
         channels = input_shape[-1]
-        self.group_norm = layers.GroupNormalization(groups=min(32, channels))
+        self.group_norm = layers.GroupNormalization(groups=min(32, channels), dtype='float32')
         self.attention = layers.MultiHeadAttention(
             num_heads=self.num_heads,
             key_dim=channels // self.num_heads
@@ -259,9 +292,11 @@ class SparseSelfAttention(layers.Layer):
         width = tf.shape(x)[2]
         channels = tf.shape(x)[3]
 
-        # Normalize and flatten to sequence: [B, H, W, C] -> [B, H*W, C]
+        # Normalize in float32, then cast back to compute dtype before gating/attention.
+        # group_norm is dtype='float32' so h is float32; keep_f is cast to x.dtype (float16
+        # under mixed precision). Without this cast, seq * keep_f is float32 × float16 → error.
         h = self.group_norm(x)
-        seq = tf.reshape(h, [batch, height * width, channels])
+        seq = tf.cast(tf.reshape(h, [batch, height * width, channels]), x.dtype)
         seq_len = height * width
 
         # Per-token magnitude (L2 over channels); shape [B, H*W]
@@ -487,7 +522,7 @@ def build_unet(config):
     
     # Output projection
     out_channels = h.shape[-1]
-    h = layers.GroupNormalization(groups=min(32, out_channels))(h)
+    h = layers.GroupNormalization(groups=min(32, out_channels), dtype='float32')(h)
     h = layers.Activation('swish')(h)
     # Force final output to float32 so the loss is always computed in fp32
     # under mixed precision training (no-op when policy is float32).
@@ -509,8 +544,8 @@ if __name__ == "__main__":
     
     print("Testing U-Net model construction...")
     
-    # Test with local config
-    config = get_config('local')
+    # Test with specific config
+    config = get_config('diagnostic')
     model = build_unet(config)
     
     print("\n" + "="*60)

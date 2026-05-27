@@ -232,14 +232,30 @@ def check_gradient_norms(model, X, y, config):
 def load_diag_history(path):
     """Load a magnitude diagnostic .npz (saved by _save_diag_history) into a nested dict."""
     data = np.load(path)
-    result = {'steps': data['steps'], 'weight_mean': {}, 'weight_max': {}, 'act_mean': {}, 'act_std': {}}
-    prefix_map = {'wmean': 'weight_mean', 'wmax': 'weight_max', 'amean': 'act_mean', 'astd': 'act_std'}
+    result = {
+        'steps': data['steps'],
+        'weight_mean': {}, 'weight_max': {}, 'act_mean': {}, 'act_std': {},
+        'gn_risk': {}, 'grad_norm': {}, 'grad_underflow': {}, 'scalar': {},
+    }
+    prefix_map = {
+        'wmean':  'weight_mean',
+        'wmax':   'weight_max',
+        'amean':  'act_mean',
+        'astd':   'act_std',
+        'gnrisk': 'gn_risk',
+        'gnorm':  'grad_norm',
+        'guflow': 'grad_underflow',
+        'scalar': 'scalar',
+    }
     for key in data.files:
         if key == 'steps':
             continue
+        if '__' not in key:
+            continue  # skip keys without namespace separator rather than crashing
         prefix, name = key.split('__', 1)
-        if prefix in prefix_map:
-            result[prefix_map[prefix]][name] = data[key]
+        dest = prefix_map.get(prefix)
+        if dest is not None:
+            result[dest][name] = data[key]
     return result
 
 

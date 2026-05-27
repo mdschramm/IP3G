@@ -60,7 +60,7 @@ CONFIG_REMOTE = {
     'in_channels': 1,
     'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
     'num_res_blocks': 3,                  # 2 blocks per level (~6-8M params, ~750-1000 params/image)
-    'attention_resolutions': [32],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
+    'attention_resolutions': [16],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
     'num_heads': 4,
     'dropout': 0.1,
     'embedding_dim': 256,                 # Scaled down with channels
@@ -112,7 +112,7 @@ CONFIG_DIAGNOSTIC = {
     'in_channels': 1,
     'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
     'num_res_blocks': 3,                  # 2 blocks per level (~6-8M params, ~750-1000 params/image)
-    'attention_resolutions': [32],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
+    'attention_resolutions': [16],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
     'num_heads': 4,
     'dropout': 0.1,
     'embedding_dim': 256,                 # Scaled down with channels
@@ -123,22 +123,22 @@ CONFIG_DIAGNOSTIC = {
 
     # Short training run — no intermediate checkpoints or sample images, only final model
     'batch_size': 32,
-    'learning_rate': 5e-5,
+    'learning_rate': 5e-4,
     'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0. better for short non-convergent runs
-    'num_steps': 10_000,
+    'num_steps': 30_000,
     'save_interval': 999_999,         # Disabled: only the final save at end of train() fires
     'sample_interval': 2_000,
-    'log_interval': 50,               # Very frequent — watch loss shape closely
-    'diag_interval': 200,              # Weight/activation magnitude logging interval
-    'ema_decay': 0.997,                # Fast EMA for short run
+    'log_interval': 100,               # Very frequent — watch loss shape closely
+    'diag_interval': 400,              # Weight/activation magnitude logging interval
+    'ema_decay': 0.9995,                # Fast EMA for short run
     'gradient_clip': 1.0,
-    'warmup_steps': 500,              # 10% of num_steps (matches local proportion)
+    'warmup_steps': 1500,              # 10% of num_steps (matches local proportion)
     'mixed_precision': True,          # Must match remote to catch FP16 issues early
 
     # Same diffusion settings as remote
     'timesteps': 1000,
     'variance_schedule': 'cosine',
-    'noise_timestep_range': [200, 400],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
+    'noise_timestep_range': [100, 600],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
     'eps_threshold': 0.05,
 
     # CFG

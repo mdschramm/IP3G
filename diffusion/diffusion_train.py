@@ -222,6 +222,136 @@ def _collect_diag_step(model, probe_model, probe_names, x_noisy, timesteps, clas
     return w_mean, w_max, a_mean, a_std
 
 
+def _adagn_scale_stats(model):
+    """Estimate mean AdaGN scale and tanh saturation fraction across all blocks.
+
+    Feeds a unit-norm synthetic conditioning vector through each scale_shift_mlp
+    and computes 1 + tanh(scale_raw) per channel. This approximates the scale
+    magnitude the model applies at each AdaGN block, independent of the actual
+    conditioning input.
+
+    Returns:
+        mean_scale: float — mean scale value across all channels and blocks.
+            Close to 1.0 is healthy (near-identity). Approaching 2.0 = saturated.
+        frac_saturated: float — fraction of (block, channel) pairs with scale > 1.8
+            (tanh_arg > ~1.1, i.e., in the flat tail where gradients are ~zero).
+    """
+    # Weights are at paths like res_net_block_N/ada_gn_M/dense_K/kernel.
+    # Match ada_gn Dense layers inside res_net_blocks; exclude the time/class MLP.
+    mlp_params = {}  # path_prefix -> {'kernel': Tensor, 'bias': Tensor}
+    for w in model.trainable_weights:
+        p = w.path
+        if 'ada_gn' not in p or 'res_net_block' not in p:
+            continue
+        prefix, kind = p.rsplit('/', 1)
+        mlp_params.setdefault(prefix, {})[kind] = tf.cast(w, tf.float32)
+
+    if not mlp_params:
+        return None, None
+
+    scale_means = []
+    for params in mlp_params.values():
+        K = params.get('kernel')  # [cond_dim, 2*C]
+        if K is None:
+            continue
+        C        = K.shape[-1] // 2
+        cond_dim = K.shape[0]
+        # Unit-norm synthetic conditioning: approximates a well-normalized
+        # conditioning vector as produced by the time/class embedding MLP.
+        cond      = tf.ones([1, cond_dim], dtype=tf.float32) / tf.sqrt(float(cond_dim))
+        scale_raw = tf.matmul(cond, K[:, :C])
+        if (b := params.get('bias')) is not None:
+            scale_raw = scale_raw + b[None, :C]
+        scale_means.append(float(tf.reduce_mean(1.0 + tf.tanh(scale_raw))))
+
+    mean_scale      = float(np.mean(scale_means))
+    frac_saturated  = float(np.mean([s > 1.8 for s in scale_means]))
+    return mean_scale, frac_saturated
+
+
+_FP16_MIN_NORMAL = 6.1e-5  # Smallest positive normal FP16 value
+
+
+def _gn_precision_risks(a_mean, a_std):
+    """Estimate FP16 GroupNorm precision risk per activation layer.
+
+    Zero compute overhead — purely post-processes existing activation stats.
+
+    GroupNorm computes (x - μ) / σ.  In FP16 the quantization unit at magnitude
+    M is M / 1024.  When that unit exceeds the within-tensor std, the subtraction
+    (x - μ) loses all signal (catastrophic cancellation) and GN outputs noise/zero
+    instead of normalised features.
+
+    Risk ratio = (FP16 quant unit at mean magnitude) / observed std
+               = a_mean / (1024 × a_std)
+
+    Interpretation:
+        < 0.10  — safe, large precision headroom
+        0.1–1.0 — marginal, monitor closely
+        > 1.0   — cancellation would occur in FP16 (protected by dtype='float32' fix)
+    """
+    risks = {}
+    for name in a_mean:
+        std = a_std.get(name, 0.0)
+        if std > 1e-8:
+            risks[name] = float(a_mean[name]) / (1024.0 * float(std))
+    return risks
+
+
+_GRAD_NORM_MAX_SAMPLES = 4  # Small batch for the diagnostic backward pass
+
+
+def _collect_grad_norms(model, x_noisy, timesteps, class_labels, true_noise, loss_scale=1.0):
+    """Compute per-layer-group gradient norms without applying weight updates.
+
+    Uses only the first _GRAD_NORM_MAX_SAMPLES samples from the batch to bound
+    peak GPU memory. The full training batch (e.g. 32) at attention resolution
+    32×32 allocates a [B, heads, 1024, 1024] float32 score tensor per attention
+    layer (~512 MB each); combined with the GradientTape holding all forward
+    activations this OOMs a 16 GB GPU that is already near capacity from training.
+    4 samples is sufficient to detect gradient underflow fractions reliably.
+
+    Gradient underflow threshold = FP16_MIN_NORMAL / loss_scale.
+    With LossScaleOptimizer scaling gradients up by loss_scale before FP16 storage,
+    a true gradient must be below (FP16_MIN_NORMAL / loss_scale) to underflow.
+    If loss_scale has been repeatedly halved (overflow events), this threshold rises
+    and underflow protection weakens.
+
+    Returns:
+        grad_norms:     dict  layer_group -> mean gradient L2 norm
+        underflow_frac: dict  layer_group -> fraction of elements below underflow threshold
+    """
+    n = _GRAD_NORM_MAX_SAMPLES
+    x_s  = x_noisy[:n]
+    t_s  = timesteps[:n]
+    c_s  = class_labels[:n]
+    y_s  = true_noise[:n]
+
+    with tf.GradientTape() as tape:
+        pred = model([x_s, t_s, c_s], training=False)
+        loss = tf.reduce_mean(tf.square(pred - tf.cast(y_s, pred.dtype)))
+    grads = tape.gradient(loss, model.trainable_weights)
+
+    threshold = _FP16_MIN_NORMAL / max(float(loss_scale), 1.0)
+
+    group_norms = {}
+    group_uflow = {}
+    for w, g in zip(model.trainable_weights, grads):
+        if g is None:
+            continue
+        parts = w.path.split('/')
+        group = parts[1] if len(parts) > 2 else parts[0]
+        g32 = tf.cast(g, tf.float32)
+        group_norms.setdefault(group, []).append(float(tf.norm(g32)))
+        group_uflow.setdefault(group, []).append(
+            float(tf.reduce_mean(tf.cast(tf.abs(g32) < threshold, tf.float32)))
+        )
+
+    grad_norms     = {k: float(np.mean(v)) for k, v in group_norms.items()}
+    underflow_frac = {k: float(np.mean(v)) for k, v in group_uflow.items()}
+    return grad_norms, underflow_frac
+
+
 def _save_diag_history(history, path):
     """Persist diagnostic history as a flat npz. Keys use '__' as namespace separator."""
     flat = {'steps': np.array(history['steps'], dtype=np.int32)}
@@ -233,6 +363,14 @@ def _save_diag_history(history, path):
         flat[f'amean__{layer}'] = np.array(vals, dtype=np.float32)
     for layer, vals in history['act_std'].items():
         flat[f'astd__{layer}'] = np.array(vals, dtype=np.float32)
+    for layer, vals in history.get('gn_risk', {}).items():
+        flat[f'gnrisk__{layer}'] = np.array(vals, dtype=np.float32)
+    if history.get('loss_scale'):
+        flat['scalar__loss_scale'] = np.array(history['loss_scale'], dtype=np.float32)
+    for layer, vals in history.get('grad_norm', {}).items():
+        flat[f'gnorm__{layer}'] = np.array(vals, dtype=np.float32)
+    for layer, vals in history.get('grad_underflow', {}).items():
+        flat[f'guflow__{layer}'] = np.array(vals, dtype=np.float32)
     np.savez(path, **flat)
 
 
@@ -458,7 +596,10 @@ def train(config, resume_from=None):
     else:
         diag_prefix = 'diffusion_'
     diag_path = os.path.join(ckpt_dir, f'{diag_prefix}{run_id}_magnitudes.npz')
-    diag_history = {'steps': [], 'weight_mean': {}, 'weight_max': {}, 'act_mean': {}, 'act_std': {}}
+    diag_history = {
+        'steps': [], 'weight_mean': {}, 'weight_max': {}, 'act_mean': {}, 'act_std': {},
+        'gn_risk': {}, 'loss_scale': [], 'grad_norm': {}, 'grad_underflow': {},
+    }
     if diag_interval < 999_999:
         print(f"  Diagnostic magnitude logging every {diag_interval} steps → {diag_path}")
 
@@ -532,6 +673,22 @@ def train(config, resume_from=None):
                 diag_history['act_mean'].setdefault(k, []).append(v)
             for k, v in a_std.items():
                 diag_history['act_std'].setdefault(k, []).append(v)
+
+            # FP16 precision diagnostics — zero-overhead GN risk + one extra backward pass
+            loss_scale = float(getattr(optimizer, 'loss_scale', 1.0))
+            gn_risks = _gn_precision_risks(a_mean, a_std)
+            grad_norms, uflow_frac = _collect_grad_norms(
+                model, inputs['X_noisy'], inputs['timesteps'], inputs['class_labels'],
+                true_noise, loss_scale=loss_scale,
+            )
+            diag_history['loss_scale'].append(loss_scale)
+            for k, v in gn_risks.items():
+                diag_history['gn_risk'].setdefault(k, []).append(v)
+            for k, v in grad_norms.items():
+                diag_history['grad_norm'].setdefault(k, []).append(v)
+            for k, v in uflow_frac.items():
+                diag_history['grad_underflow'].setdefault(k, []).append(v)
+
             _save_diag_history(diag_history, diag_path)
 
             # Save rolling checkpoint so a killed run still has recent weights
@@ -547,7 +704,16 @@ def train(config, resume_from=None):
 
             all_wm = list(w_mean.values())
             all_am = list(a_mean.values()) if a_mean else [float('nan')]
-            print(f"  [diag] mean_|w|={np.mean(all_wm):.4f}  max_|w|={max(w_max.values()):.4f}  mean_|act|={np.mean(all_am):.4f}  ckpt→{os.path.basename(diag_ckpt)}")
+            mean_scale, frac_sat = _adagn_scale_stats(model)
+            scale_str = f"  adagn_scale={mean_scale:.3f}  sat_frac={frac_sat:.2f}" if mean_scale is not None else ""
+            max_gn_risk  = max(gn_risks.values())  if gn_risks   else float('nan')
+            mean_uflow   = np.mean(list(uflow_frac.values())) if uflow_frac else float('nan')
+            print(
+                f"  [diag] mean_|w|={np.mean(all_wm):.4f}  max_|w|={max(w_max.values()):.4f}"
+                f"  mean_|act|={np.mean(all_am):.4f}{scale_str}"
+                f"  gn_risk={max_gn_risk:.3f}  loss_scale={loss_scale:.0f}  grad_uflow={mean_uflow:.3f}"
+                f"  ckpt→{os.path.basename(diag_ckpt)}"
+            )
 
         # Track metrics
         losses.append(float(loss))

@@ -188,12 +188,14 @@ pull_preprocessing_from_gcs() {
 push_output_to_gcs() {
     local module="${1:-}"
     if [ -n "$module" ]; then
-        echo "Pushing $module/remote outputs to GCS"
+        echo "Pushing $module/remote and diagnostic outputs to GCS"
         gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gsutil -m rsync -r $VM_OUTPUT_BASE/$module/remote gs://$GCS_BUCKET_NAME/output/$module/remote"
+        gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gsutil -m rsync -r $VM_OUTPUT_BASE/$module/diagnostic gs://$GCS_BUCKET_NAME/output/$module/diagnostic"
     else
         echo "Pushing all model outputs to GCS"
         for mod in gan classifier diffusion; do
             gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gsutil -m rsync -r $VM_OUTPUT_BASE/$mod/remote gs://$GCS_BUCKET_NAME/output/$mod/remote"
+            gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo gsutil -m rsync -r $VM_OUTPUT_BASE/$mod/diagnostic gs://$GCS_BUCKET_NAME/output/$mod/diagnostic"
         done
     fi
     echo "Outputs at gs://$GCS_BUCKET_NAME/output/"
