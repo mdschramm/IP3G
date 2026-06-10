@@ -136,14 +136,15 @@ def _ddim_step(
     x_in      = tf.concat([x, x], axis=0)
     t_in      = tf.concat([t_tensor, t_tensor], axis=0)
     labels_in = tf.concat([uncond_labels, cond_labels], axis=0)
-    eps_both  = model([x_in, t_in, labels_in], training=False)
+    eps_both, _ = model([x_in, t_in, labels_in], training=False)
+    eps_both  = tf.cast(eps_both, tf.float32)
     eps_hat   = eps_both[:batch] + guidance_scale * (eps_both[batch:] - eps_both[:batch])
 
     # Optional soft-threshold on predicted noise
     eps_hat = tf.sign(eps_hat) * tf.nn.relu(tf.abs(eps_hat) - eps_threshold)
 
     # Alpha values for current and previous step
-    ab_t      = tf.gather(tf.constant(diffusion_utils.alpha_cumprod), t_tensor[0])
+    ab_t      = tf.gather(tf.constant(diffusion_utils.alpha_cumprod, dtype=tf.float32), t_tensor[0])
     ab_t_prev = t_prev_ab   # pre-computed by caller
 
     # Predicted clean image (x̂₀)

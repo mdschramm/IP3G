@@ -1,7 +1,10 @@
 """
-Configuration for Conditional DDPM with Classifier-Free Guidance.
+Configuration for EDM2 Conditional Diffusion with Classifier-Free Guidance.
 
 Provides separate configurations for local (Mac M2) and remote (A100) training.
+Noise parameterization uses EDM2 (Karras et al. 2022/2023): continuous sigma
+sampled from a log-normal, with c_skip/c_out/c_in preconditioning so the loss
+weight w(σ)·c_out²=1 at all noise levels.
 """
 
 # Local configuration - Mac M2, 16GB RAM (architectural sanity check, ~2-3 hours)
@@ -11,40 +14,44 @@ CONFIG_LOCAL = {
     'in_channels': 1,
     'channels': [32, 64, 128],           # 3 levels (kept small for M2)
     'num_res_blocks': 2,                  # Per resolution
-    'attention_resolutions': [],        # Bottleneck attention enabled to exercise sparse attn path
-    'num_heads': 4,                       # For attention layers
+    'attention_resolutions': [],          # No mid-run attention on M2 (bottleneck only)
+    'num_heads': 4,
     'dropout': 0.1,
     'embedding_dim': 256,                 # Time + class embeddings
-    'num_classes': 54,                    # Gene expression classes
-    'excluded_classes': [6, 24, 25, 31],  # Classes with <10 samples — too few for CFG conditioning
-    'use_sparse_attention': False,         # Top-k masked attention (sparsity fix)
-    'sparse_top_k_frac': 0.5,             # Attend to top 50% of tokens by magnitude
-    
+    'num_classes': 54,                    # GTEx tissue/disease classes
+    'excluded_classes': [6, 24, 25, 31],  # Classes with <10 samples — too few for CFG
+    'use_sparse_attention': False,
+    'sparse_top_k_frac': 0.5,
+    'res_balance': 0.3,                   # mp_sum weight: (1-t)*skip + t*residual; 0.3 → 70/30 (EDM2 default)
+
     # Training (~2-3 hours on M2)
     'batch_size': 8,                      # M1/M2 memory headroom
-    'learning_rate': 5e-5,
+    'learning_rate': 3e-4,
     'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0
-    'num_steps': 700,                   # Enough to validate loss trajectory + early structure
+    'num_steps': 1000,
     'save_interval': 999_999,
-    'sample_interval': 250,               # Frequent so we can watch structure emerge
+    'sample_interval': 250,
     'log_interval': 1,
-    'diag_interval': 20,                  # Weight/activation magnitude logging interval
-    'ema_decay': 0.99,                   # Lower so EMA tracks fast in short runs (rule of thumb rolling averages weights in 1 / (1 - decay))
+    'diag_interval': 20,
+    'ema_decay': 0.99,                    # Lower so EMA tracks fast in short runs
     'gradient_clip': 1.0,
-    'warmup_steps': 50,                  # Proportional to num_steps
-    'mixed_precision': False,             # M2 doesn't benefit much
+    'warmup_steps': 50,
+    'mixed_precision': True,
 
-    # Diffusion
-    'timesteps': 1000,
-    'variance_schedule': 'cosine',
-    'noise_timestep_range': [200, 400],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
-
-    # Preprocessing / sampling fixes
-    'eps_threshold': 0.05,                # Soft-threshold predicted noise during sampling
+    # EDM2 noise parameterization
+    'sigma_data': 0.139,                  # std of normalized training data (measured: np.std(resized_expressions.npy))
+    'P_mean': -2.0,                       # log-normal σ center: exp(-2.0)≈0.135≈sigma_data
+    'P_std': 1.2,                         # log-normal σ spread (paper default)
+    'sigma_min': 0.002,                   # near-clean inference endpoint
+    'sigma_max': 80.0,                    # pure-noise inference starting point
+    'sigma_rho': 7,                       # Karras step-density exponent (more steps near sigma_min)
 
     # Classifier-free guidance
-    'dropout_rate': 0.10,                 # 15% unconditional dropout
-    
+    'dropout_rate': 0.10,
+
+    # FP16 safety
+    'act_clip_magnitude': 256.0,          # Clamp encoder/decoder block outputs to ±this value (EDM2 §B)
+
     # Data
     'data_dir': 'output/preprocessing',
     'feature_file': 'resized_expressions.npy',
@@ -53,46 +60,50 @@ CONFIG_LOCAL = {
     'sample_dir': 'output/diffusion/local/samples',
 }
 
-# Remote configuration - NVIDIA A100 40GB (Full Training)
+# Remote configuration - NVIDIA GPU
 CONFIG_REMOTE = {
     # Model architecture
     'image_size': 128,
     'in_channels': 1,
     'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
-    'num_res_blocks': 3,                  # 2 blocks per level (~6-8M params, ~750-1000 params/image)
-    'attention_resolutions': [16],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
+    'num_res_blocks': 3,
+    'attention_resolutions': [16],        # Attention at 16×16 bottleneck resolution
     'num_heads': 4,
     'dropout': 0.1,
-    'embedding_dim': 256,                 # Scaled down with channels
-    'num_classes': 54, # GTEX
-    'excluded_classes': [6, 24, 25, 31],  # Classes with <10 samples — too few for CFG conditioning
-    'use_sparse_attention': False,         # Top-k masked attention
+    'embedding_dim': 256,
+    'num_classes': 54,
+    'excluded_classes': [6, 24, 25, 31],
+    'use_sparse_attention': False,
     'sparse_top_k_frac': 0.5,
+    'res_balance': 0.3,
 
     # Training
-    'batch_size': 128,                    # Large batch to reduce gradient variance at low-noise timesteps
+    'batch_size': 128,
     'learning_rate': 5e-5,
     'lr_schedule': 'cosine',
-    'num_steps': 500_000,                  # Longer to let new architecture converge
+    'num_steps': 500_000,
     'save_interval': 10_000,
     'sample_interval': 5_000,
     'log_interval': 250,
-    'diag_interval': 999_999,             # Disabled for remote — too costly
+    'diag_interval': 999_999,            # Disabled for remote — too costly
     'ema_decay': 0.9999,
     'gradient_clip': 1.0,
     'warmup_steps': 25_000,
-    'mixed_precision': True,              # Use FP16 for speed
+    'mixed_precision': True,
 
-    # Diffusion
-    'timesteps': 1000,
-    'variance_schedule': 'cosine',
-    'noise_timestep_range': [1, 200],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
-
-    # Preprocessing / sampling fixes
-    'eps_threshold': 0.05,                # Soft-threshold predicted noise during sampling
+    # EDM2 noise parameterization
+    'sigma_data': 0.139,
+    'P_mean': -2.0,
+    'P_std': 1.2,
+    'sigma_min': 0.002,
+    'sigma_max': 80.0,
+    'sigma_rho': 7,
 
     # Classifier-free guidance
     'dropout_rate': 0.10,
+
+    # FP16 safety
+    'act_clip_magnitude': 256.0,
 
     # Data
     'data_dir': 'output/preprocessing',
@@ -103,46 +114,52 @@ CONFIG_REMOTE = {
 }
 
 
-# Diagnostic configuration — full remote architecture, 8000 steps
-# Intent: run remotely for ~10 min to validate model behaviour (loss shape,
-# CFG separation, gradient norms) before committing to a full 75k-step run.
+# Diagnostic configuration — full remote architecture, 30k steps
+# Intent: run remotely to validate model behaviour (loss shape, CFG separation,
+# gradient norms) before committing to a full 500k-step run.
 CONFIG_DIAGNOSTIC = {
     # Architecture — identical to remote so results are representative
     'image_size': 128,
     'in_channels': 1,
-    'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
-    'num_res_blocks': 3,                  # 2 blocks per level (~6-8M params, ~750-1000 params/image)
-    'attention_resolutions': [16],         # 32×32 in encoder+decoder; bottleneck always has 16×16 regardless
+    'channels': [32, 64, 128, 256],
+    'num_res_blocks': 3,
+    'attention_resolutions': [16],
     'num_heads': 4,
     'dropout': 0.1,
-    'embedding_dim': 256,                 # Scaled down with channels
-    'num_classes': 54, # GTEX
-    'excluded_classes': [6, 24, 25, 31],  # Classes with <10 samples — too few for CFG conditioning
-    'use_sparse_attention': False,         # Top-k masked attention
+    'embedding_dim': 256,
+    'num_classes': 54,
+    'excluded_classes': [6, 24, 25, 31],
+    'use_sparse_attention': False,
     'sparse_top_k_frac': 0.5,
+    'res_balance': 0.3,
 
-    # Short training run — no intermediate checkpoints or sample images, only final model
+    # Short training run
     'batch_size': 32,
-    'learning_rate': 5e-4,
-    'lr_schedule': 'flat',                # warmup + constant; plateau = model, not LR→0. better for short non-convergent runs
+    'learning_rate': 3e-4,
+    'lr_schedule': 'cosine',
     'num_steps': 30_000,
-    'save_interval': 999_999,         # Disabled: only the final save at end of train() fires
+    'save_interval': 999_999,            # Only the final save fires
     'sample_interval': 2_000,
-    'log_interval': 100,               # Very frequent — watch loss shape closely
-    'diag_interval': 400,              # Weight/activation magnitude logging interval
-    'ema_decay': 0.9995,                # Fast EMA for short run
+    'log_interval': 100,
+    'diag_interval': 500,
+    'ema_decay': 0.9995,
     'gradient_clip': 1.0,
-    'warmup_steps': 1500,              # 10% of num_steps (matches local proportion)
-    'mixed_precision': True,          # Must match remote to catch FP16 issues early
+    'warmup_steps': 1500,                # ~5% of num_steps
+    'mixed_precision': True,
 
-    # Same diffusion settings as remote
-    'timesteps': 1000,
-    'variance_schedule': 'cosine',
-    'noise_timestep_range': [100, 600],      # t ∈ [t_min, t_max] for training and DDIM [t_start, t_end]
-    'eps_threshold': 0.05,
+    # EDM2 noise parameterization
+    'sigma_data': 0.139,
+    'P_mean': -2.0,
+    'P_std': 1.2,
+    'sigma_min': 0.002,
+    'sigma_max': 80.0,
+    'sigma_rho': 7,
 
     # CFG
     'dropout_rate': 0.1,
+
+    # FP16 safety
+    'act_clip_magnitude': 256.0,
 
     # Data
     'data_dir': 'output/preprocessing',
@@ -154,14 +171,10 @@ CONFIG_DIAGNOSTIC = {
 
 
 def get_config(mode='local'):
-    """
-    Get configuration for specified mode.
-    
+    """Return configuration dict for the specified training mode.
+
     Args:
-        mode: 'local' for Mac M2 or 'remote' for A100
-        
-    Returns:
-        Configuration dictionary
+        mode: 'local' (Mac M2), 'remote' (A100), or 'diagnostic' (30k-step remote arch)
     """
     if mode == 'local':
         return CONFIG_LOCAL.copy()
@@ -178,7 +191,7 @@ def print_config(config):
     print("\n" + "="*60)
     print("DIFFUSION MODEL CONFIGURATION")
     print("="*60)
-    
+
     print("\n📐 Model Architecture:")
     print(f"  Image size: {config['image_size']}×{config['image_size']}")
     print(f"  Channels: {config['channels']}")
@@ -186,7 +199,8 @@ def print_config(config):
     print(f"  Attention at resolutions: {config['attention_resolutions']}")
     print(f"  Embedding dimension: {config['embedding_dim']}")
     print(f"  Number of classes: {config['num_classes']}")
-    
+    print(f"  Residual balance: {config.get('res_balance', 0.3)} (skip/residual split)")
+
     print("\n🎯 Training:")
     print(f"  Batch size: {config['batch_size']}")
     print(f"  Learning rate: {config['learning_rate']}  schedule: {config.get('lr_schedule', 'cosine')}")
@@ -195,33 +209,30 @@ def print_config(config):
     print(f"  Diag interval: {config.get('diag_interval', 'disabled')}")
     print(f"  Mixed precision: {config['mixed_precision']}")
     print(f"  EMA decay: {config['ema_decay']}")
-    
-    print("\n🔀 Diffusion:")
-    print(f"  Timesteps: {config['timesteps']}")
-    print(f"  Schedule: {config['variance_schedule']}")
-    ntr = config.get('noise_timestep_range', [1, config['timesteps']])
-    print(f"  Noise timestep range: [{ntr[0]}, {ntr[1]}] (training t_min..t_max, DDIM t_end..t_start)")
+
+    print("\n🔀 EDM2 Noise:")
+    print(f"  sigma_data: {config['sigma_data']}  (std of normalized training data)")
+    print(f"  P_mean: {config['P_mean']}  P_std: {config['P_std']}  → median σ ≈ {config['P_mean']:.2f}|exp = {2.718**config['P_mean']:.3f}")
+    print(f"  sigma range: [{config['sigma_min']}, {config['sigma_max']}]  rho: {config.get('sigma_rho', 7)}")
     print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%")
-    print(f"  Sparse attention: {config.get('use_sparse_attention', False)}"
-          + (f" (top-{int(config.get('sparse_top_k_frac', 0.5)*100)}%)" if config.get('use_sparse_attention', False) else ""))
-    print(f"  Sampling eps threshold: {config.get('eps_threshold', 0.0)}")
-    
+    print(f"  Act clip magnitude: ±{config.get('act_clip_magnitude', 256.0)}")
+
     print("\n💾 Data:")
     print(f"  Data directory: {config['data_dir']}")
     print(f"  Checkpoint directory: {config['checkpoint_dir']}")
     print(f"  Sample directory: {config['sample_dir']}")
-    
+
     print("="*60 + "\n")
 
 
 if __name__ == "__main__":
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='View diffusion model configurations')
-    parser.add_argument('--mode', type=str, choices=['local', 'remote'], default='local',
+    parser.add_argument('--mode', type=str, choices=['local', 'remote', 'diagnostic'], default='local',
                         help='Configuration mode to display')
     args = parser.parse_args()
-    
+
     config = get_config(args.mode)
     print(f"\n{args.mode.upper()} Configuration:")
     print_config(config)

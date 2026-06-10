@@ -10,6 +10,7 @@ to a full remote run:
 """
 
 import argparse
+import csv
 import os
 import sys
 import numpy as np
@@ -345,6 +346,63 @@ def plot_magnitude_history(diag_file, output_path=None, top_n=8, weight_names=No
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 7. CSV export of magnitude history
+# ─────────────────────────────────────────────────────────────────────────────
+
+def export_magnitude_csv(diag_file, output_path=None, top_n=15, sample_interval=500):
+    """Export top-n weight and activation magnitudes to CSV.
+
+    Rows are (step, kind, layer, value) in long/tidy format, sampled at the
+    recorded step nearest to each sample_interval boundary.
+
+    Usage:
+        python -m diffusion.diagnostics --export-csv path/to/magnitudes.npz
+        python -m diffusion.diagnostics --export-csv path/to/magnitudes.npz --top-n 20 --sample-interval 1000
+
+    Args:
+        diag_file: Path to the .npz file produced during training.
+        output_path: Where to save the CSV. Defaults to <diag_file>_magnitudes.csv.
+        top_n: Number of layers to include, ranked by final magnitude.
+        sample_interval: Approximate step gap between rows (snaps to nearest recorded step).
+
+    Returns:
+        output_path: Path where the CSV was saved.
+    """
+    hist = load_diag_history(diag_file)
+    steps = hist['steps']
+
+    # Snap to the recorded step nearest each sample_interval boundary
+    marks = np.arange(0, int(steps[-1]) + sample_interval, sample_interval)
+    sampled_idx = sorted(set(int(np.argmin(np.abs(steps - m))) for m in marks))
+
+    def _top_keys(d, n):
+        if not d:
+            return []
+        scored = {k: float(v[-1]) for k, v in d.items() if len(v) > 0}
+        return sorted(scored, key=scored.get, reverse=True)[:n]
+
+    w_keys = _top_keys(hist['weight_mean'], top_n)
+    a_keys = _top_keys(hist['act_mean'], top_n)
+
+    if output_path is None:
+        output_path = diag_file.replace('.npz', '_magnitudes.csv')
+
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['step', 'kind', 'layer', 'value'])
+        for i in sampled_idx:
+            step = int(steps[i])
+            for k in w_keys:
+                writer.writerow([step, 'weight_mean', k, f'{hist["weight_mean"][k][i]:.6g}'])
+            for k in a_keys:
+                writer.writerow([step, 'act_mean', k, f'{hist["act_mean"][k][i]:.6g}'])
+
+    print(f"Saved magnitude CSV to {output_path}  "
+          f"({len(sampled_idx)} steps × {len(w_keys)} weight + {len(a_keys)} activation layers)")
+    return output_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -363,6 +421,10 @@ if __name__ == '__main__':
                         help='Comma-separated weight group names to plot instead of top-n')
     parser.add_argument('--act-names', default=None, metavar='NAMES',
                         help='Comma-separated activation layer names to plot instead of top-n')
+    parser.add_argument('--export-csv', metavar='DIAG_NPZ', default=None,
+                        help='Export top-n magnitude history to CSV and exit')
+    parser.add_argument('--sample-interval', type=int, default=500, metavar='STEPS',
+                        help='Step interval between CSV rows (default: 500)')
     args = parser.parse_args()
 
     if args.plot_magnitudes:
@@ -374,8 +436,16 @@ if __name__ == '__main__':
         )
         sys.exit(0)
 
+    if args.export_csv:
+        export_magnitude_csv(
+            args.export_csv,
+            top_n=args.top_n,
+            sample_interval=args.sample_interval,
+        )
+        sys.exit(0)
+
     if not args.checkpoint:
-        parser.error('--checkpoint is required unless --plot-magnitudes is used')
+        parser.error('--checkpoint is required unless --plot-magnitudes or --export-csv is used')
 
     config = get_config(args.mode)
     X = np.load(f"output/preprocessing/{config['feature_file']}").astype(np.float32)

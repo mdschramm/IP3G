@@ -75,26 +75,21 @@ class AdaGN(layers.Layer):
         scale_shift = self.scale_shift_mlp(conditioning)  # [B, C*2]
         scale_raw, shift = tf.split(scale_shift, 2, axis=-1)  # Each [B, C]
 
-        # Bound scale to (0, 2) via 1 + tanh. Prevents AdaGN scale from growing
-        # unboundedly as W_q/W_k weights increase during training. Without this,
-        # each ResNetBlock multiplies features by an uncapped scale, compounding
-        # exponentially across the 20+ blocks in the decoder (observed: magnitude
-        # 7 → 600 over 600 training steps in diagnostic runs).
-        # scale=1 at init (tanh(0)=0 → passthrough), max=2 when saturated.
-        # Reference: analogous to sigmoid gating in LSTMs and adaLN-Zero in DiT.
-        # Cast to float32 before modulation: group_norm output is float32 (dtype='float32'),
-        # but scale_shift_mlp runs in the global compute dtype (float16 under mixed precision).
-        # Mismatched dtypes cause a Mul op failure; casting to float32 keeps modulation
-        # arithmetic in full precision, matching the GN output.
-        scale = 1.0 + tf.tanh(tf.cast(scale_raw, tf.float32))
+        # Cast to float32: group_norm output is float32 (dtype='float32'), but
+        # scale_shift_mlp runs in the global compute dtype (float16 under mixed precision).
+        # Mismatched dtypes cause a Mul op failure; casting keeps modulation arithmetic
+        # in full precision, matching the GN output.
+        scale = tf.cast(scale_raw, tf.float32)
         shift = tf.cast(shift, tf.float32)
 
         # Reshape for broadcasting: [B, C] → [B, 1, 1, C]
         scale = scale[:, None, None, :]
         shift = shift[:, None, None, :]
 
-        # Modulate: scale * normalized + shift
-        return scale * h + shift
+        # adaLN-Zero: (1 + scale)*h + shift so scale_raw=0 at init is identity passthrough,
+        # not zero-suppression. Cast back to input dtype (FP16 under mixed precision) so
+        # downstream MPConv2D receives FP16 and computes in FP16 as intended.
+        return tf.cast((1.0 + scale) * h + shift, x.dtype)
         
     
     def get_config(self):
@@ -113,10 +108,12 @@ class ResNetBlock(layers.Layer):
     Two conv layers with AdaGN modulation and skip connection.
     """
     
-    def __init__(self, channels, dropout=0.1, **kwargs):
+    def __init__(self, channels, dropout=0.1, res_balance=0.3, **kwargs):
         super().__init__(**kwargs)
         self.channels = channels
         self.dropout_rate = dropout
+        self.res_balance = float(res_balance)
+        self._mp_denom = float(np.sqrt((1.0 - res_balance) ** 2 + res_balance ** 2))
         
     def build(self, input_shape):
         # input_shape is a list: [x_shape, conditioning_shape]
@@ -125,18 +122,18 @@ class ResNetBlock(layers.Layer):
 
         # First conv path — pre-norm on INPUT channels, then project to output channels.
         self.adagn1 = AdaGN(in_channels)
-        self.act1 = layers.Activation('swish')
-        self.conv1 = layers.Conv2D(self.channels, 3, padding='same')
-        
+        self.act1 = MPSiLU()
+        self.conv1 = MPConv2D(self.channels, 3)
+
         # Second conv path
         self.adagn2 = AdaGN(self.channels)
-        self.act2 = layers.Activation('swish')
+        self.act2 = MPSiLU()
         self.dropout = layers.Dropout(self.dropout_rate)
-        self.conv2 = layers.Conv2D(self.channels, 3, padding='same')
-        
+        self.conv2 = MPConv2D(self.channels, 3)
+
         # Skip connection (if input channels != output channels)
         if x_shape[-1] != self.channels:
-            self.skip_conv = layers.Conv2D(self.channels, 1)
+            self.skip_conv = MPConv2D(self.channels, 1)
         else:
             self.skip_conv = None
             
@@ -159,14 +156,18 @@ class ResNetBlock(layers.Layer):
         # Skip connection
         if self.skip_conv is not None:
             x = self.skip_conv(x)
-            
-        return x + h
+
+        # Asymmetric magnitude-preserving sum: (1-t)*skip + t*residual, normalised by
+        # sqrt((1-t)²+t²) so output variance equals input variance. t=0.3 (70/30) matches
+        # EDM2 res_balance default and is more conservative than the symmetric t=0.5 case.
+        return ((1.0 - self.res_balance) * x + self.res_balance * h) / self._mp_denom
     
     def get_config(self):
         config = super().get_config()
         config.update({
             'channels': self.channels,
             'dropout': self.dropout_rate,
+            'res_balance': self.res_balance,
         })
         return config
 
@@ -367,10 +368,11 @@ class TimeAndClassEmbedding(layers.Layer):
             self.embedding_dim
         )
         
-        # Time embedding MLP
+        # Time embedding MLP — MPLinear preserves magnitude through the projection
         self.time_mlp = keras.Sequential([
-            layers.Dense(self.embedding_dim * 4, activation='swish'),
-            layers.Dense(self.embedding_dim)
+            MPLinear(self.embedding_dim * 4),
+            MPSiLU(),
+            MPLinear(self.embedding_dim),
         ])
         super().build(input_shape)
         
@@ -388,6 +390,7 @@ class TimeAndClassEmbedding(layers.Layer):
         return time_emb + class_emb
     
     def get_config(self):
+        
         config = super().get_config()
         config.update({
             'num_classes': self.num_classes,
@@ -404,7 +407,7 @@ class Downsample(layers.Layer):
         self.channels = channels
         
     def build(self, input_shape):
-        self.conv = layers.Conv2D(self.channels, 3, strides=2, padding='same')
+        self.conv = MPConv2D(self.channels, 3, strides=2)
         super().build(input_shape)
         
     def call(self, x):
@@ -426,7 +429,7 @@ class Upsample(layers.Layer):
     def build(self, input_shape):
         # Nearest-neighbor upsample + conv to avoid checkerboard artifacts
         self.upsample = layers.UpSampling2D(size=2, interpolation='nearest')
-        self.conv = layers.Conv2D(self.channels, 3, padding='same')
+        self.conv = MPConv2D(self.channels, 3)
         super().build(input_shape)
         
     def call(self, x):
@@ -436,6 +439,112 @@ class Upsample(layers.Layer):
         config = super().get_config()
         config.update({'channels': self.channels})
         return config
+
+
+class MPConv2D(layers.Layer):
+    """Magnitude-preserving Conv2D (EDM2 Config D, §B.4).
+
+    Normalizes each output filter to unit L2 norm in the forward pass.
+    Formula: ŵ_i = w_i / (‖w_i‖₂ + ε), ε = 1e-4 (as in EDM2 paper).
+    This prevents conv weight growth from amplifying activations across training,
+    which is the root cause of the decoder activation explosion seen in diagnostic runs.
+
+    The underlying parameter `kernel` is trained normally via gradient descent; the
+    normalization is applied on-the-fly in call() so it never needs to be undone.
+    """
+
+    def __init__(self, filters, kernel_size, strides=1, padding='same', use_bias=True, **kwargs):
+        super().__init__(**kwargs)
+        self.filters = filters
+        self.kernel_size = kernel_size if isinstance(kernel_size, (list, tuple)) else (kernel_size, kernel_size)
+        self.strides = strides
+        self.padding = padding.upper()
+        self.use_bias = use_bias
+
+    def build(self, input_shape):
+        kh, kw = self.kernel_size
+        c_in = int(input_shape[-1])
+        self.kernel = self.add_weight(
+            shape=(kh, kw, c_in, self.filters), initializer='glorot_uniform', name='kernel')
+        if self.use_bias:
+            self.bias = self.add_weight(
+                shape=(self.filters,), initializer='zeros', name='bias')
+        super().build(input_shape)
+
+    def call(self, x):
+        w = tf.cast(self.kernel, tf.float32)
+        # Flatten to [fan_in, filters], normalize each column (output filter) to unit norm.
+        w_flat = tf.reshape(w, [-1, self.filters])
+        w_norm = w_flat / (tf.norm(w_flat, axis=0, keepdims=True) + 1e-4)
+        w_norm = tf.reshape(w_norm, self.kernel.shape)
+        w_norm = tf.cast(w_norm, x.dtype)
+        y = tf.nn.conv2d(x, w_norm,
+                         strides=[1, self.strides, self.strides, 1],
+                         padding=self.padding)
+        if self.use_bias:
+            y = y + tf.cast(self.bias, x.dtype)
+        return y
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'filters': self.filters, 'kernel_size': self.kernel_size,
+                    'strides': self.strides, 'padding': self.padding.lower(),
+                    'use_bias': self.use_bias})
+        return cfg
+
+
+class MPLinear(layers.Layer):
+    """Magnitude-preserving Dense layer (EDM2 Config D, §B.4).
+
+    Same principle as MPConv2D: normalizes each output neuron's weight vector to
+    unit norm. Formula: ŵ_i = w_i / (‖w_i‖₂ + ε), ε = 1e-4 (as in EDM2 paper).
+    """
+
+    def __init__(self, units, use_bias=True, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.use_bias = use_bias
+
+    def build(self, input_shape):
+        fan_in = int(input_shape[-1])
+        self.kernel = self.add_weight(
+            shape=(fan_in, self.units), initializer='glorot_uniform', name='kernel')
+        if self.use_bias:
+            self.bias = self.add_weight(
+                shape=(self.units,), initializer='zeros', name='bias')
+        super().build(input_shape)
+
+    def call(self, x):
+        w = tf.cast(self.kernel, tf.float32)
+        w_norm = w / (tf.norm(w, axis=0, keepdims=True) + 1e-4)
+        w_norm = tf.cast(w_norm, x.dtype)
+        y = tf.matmul(x, w_norm)
+        if self.use_bias:
+            y = y + tf.cast(self.bias, x.dtype)
+        return y
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'units': self.units, 'use_bias': self.use_bias})
+        return cfg
+
+
+class MPSiLU(layers.Layer):
+    """Magnitude-preserving SiLU activation (EDM2 §B).
+
+    Divides SiLU(x) = x·σ(x) by 0.596, the expected RMS of silu(x) for
+    x ~ N(0,1), so variance is preserved through the activation. Completes
+    the MP chain alongside MPConv2D, MPLinear, and the (x+h)/√2 residual.
+
+    Mixed precision: casts the scalar divisor to x.dtype so output dtype
+    matches input (float16 under mixed precision, float32 otherwise).
+    """
+
+    def call(self, x):
+        return tf.keras.activations.swish(x) / tf.cast(0.596, x.dtype)
+
+    def get_config(self):
+        return super().get_config()
 
 
 def build_unet(config):
@@ -457,13 +566,16 @@ def build_unet(config):
     num_heads = config['num_heads']
     dropout = config['dropout']
     embedding_dim = config['embedding_dim']
+    act_clip = float(config.get('act_clip_magnitude', 256.0))
     num_classes = config['num_classes']
     use_sparse_attention = config.get('use_sparse_attention', False)
     sparse_top_k_frac = config.get('sparse_top_k_frac', 0.5)
     
-    # Inputs
+    res_balance = config.get('res_balance', 0.3)
+
+    # Inputs — t_input is float32: receives c_noise = ln(σ)/4 (continuous EDM2 conditioning)
     x_input = layers.Input(shape=(image_size, image_size, in_channels), name='x_noisy')
-    t_input = layers.Input(shape=(), dtype=tf.int32, name='timesteps')
+    t_input = layers.Input(shape=(), dtype=tf.float32, name='timesteps')
     c_input = layers.Input(shape=(), dtype=tf.int32, name='class_labels')
     
     # Embeddings
@@ -471,7 +583,7 @@ def build_unet(config):
     conditioning = embedding_layer([t_input, c_input])
     
     # Initial convolution
-    h = layers.Conv2D(channels[0], 3, padding='same')(x_input)
+    h = MPConv2D(channels[0], 3)(x_input)
     
     # Encoder
     skip_connections = []
@@ -480,25 +592,33 @@ def build_unet(config):
     for level, ch in enumerate(channels):
         # ResNet blocks
         for _ in range(num_res_blocks):
-            h = ResNetBlock(ch, dropout)([h, conditioning])
+            h = ResNetBlock(ch, dropout, res_balance=res_balance)([h, conditioning])
         
         # Self-attention at specified resolutions
         if current_resolution in attention_resolutions:
             h = _make_attention(num_heads, use_sparse_attention, sparse_top_k_frac)(h)
         
-        # Save skip connection
+        # EDM2 §B: clamp activations to ±act_clip at the end of each encoder block.
+        # Prevents rare FP16 overflow spikes from propagating through skip connections.
+        h = keras.ops.clip(h, -act_clip, act_clip)
         skip_connections.append(h)
-        
+
         # Downsample (except at last level)
         if level < len(channels) - 1:
             h = Downsample(channels[level + 1])(h)
             current_resolution //= 2
     
     # Bottleneck
-    h = ResNetBlock(channels[-1], dropout)([h, conditioning])
+    h = ResNetBlock(channels[-1], dropout, res_balance=res_balance)([h, conditioning])
     h = _make_attention(num_heads, use_sparse_attention, sparse_top_k_frac)(h)
-    h = ResNetBlock(channels[-1], dropout)([h, conditioning])
-    
+    h = ResNetBlock(channels[-1], dropout, res_balance=res_balance)([h, conditioning])
+
+    # Logvar head (EDM2 uncertainty loss) — branches off bottleneck before decoder.
+    # GlobalAveragePooling collapses spatial dims; Dense produces one scalar per sample.
+    logvar = layers.GlobalAveragePooling2D()(h)
+    logvar = layers.Dense(1, dtype='float32')(logvar)  # [B, 1]
+    logvar = layers.Reshape((1, 1, 1))(logvar)         # [B, 1, 1, 1] — broadcasts over H×W×C
+
     # Decoder
     for level in reversed(range(len(channels))):
         ch = channels[level]
@@ -514,24 +634,26 @@ def build_unet(config):
         
         # ResNet blocks
         for _ in range(num_res_blocks):
-            h = ResNetBlock(ch, dropout)([h, conditioning])
+            h = ResNetBlock(ch, dropout, res_balance=res_balance)([h, conditioning])
         
         # Self-attention at specified resolutions
         if current_resolution in attention_resolutions:
             h = _make_attention(num_heads, use_sparse_attention, sparse_top_k_frac)(h)
-    
+
+        # EDM2 §B: clamp activations to ±act_clip at the end of each decoder block.
+        h = keras.ops.clip(h, -act_clip, act_clip)
+
     # Output projection
     out_channels = h.shape[-1]
     h = layers.GroupNormalization(groups=min(32, out_channels), dtype='float32')(h)
-    h = layers.Activation('swish')(h)
-    # Force final output to float32 so the loss is always computed in fp32
-    # under mixed precision training (no-op when policy is float32).
-    output = layers.Conv2D(in_channels, 3, padding='same', dtype='float32')(h)
+    h = MPSiLU()(h)
+    # MPConv2D output dtype matches h, which is float32 from the preceding GroupNorm.
+    output = MPConv2D(in_channels, 3)(h)
     
-    # Build model
+    # Build model — outputs [pred_noise, logvar]; logvar is [B,1,1,1], pred_noise is [B,H,W,C]
     model = keras.Model(
         inputs=[x_input, t_input, c_input],
-        outputs=output,
+        outputs=[output, logvar],
         name='conditional_unet'
     )
     
@@ -560,7 +682,7 @@ if __name__ == "__main__":
     
     batch_size = 4
     x_test = tf.random.normal([batch_size, 128, 128, 1])
-    t_test = tf.random.uniform([batch_size], 0, 1000, dtype=tf.int32)
+    t_test = tf.random.uniform([batch_size], -1.55, 1.10, dtype=tf.float32)  # c_noise = ln(sigma)/4
     c_test = tf.random.uniform([batch_size], 0, 54, dtype=tf.int32)
     
     print(f"Input shapes:")
@@ -568,9 +690,9 @@ if __name__ == "__main__":
     print(f"  timesteps: {t_test.shape}")
     print(f"  class_labels: {c_test.shape}")
     
-    output = model([x_test, t_test, c_test], training=False)
-    print(f"\nOutput shape: {output.shape}")
-    print(f"Output range: [{tf.reduce_min(output):.4f}, {tf.reduce_max(output):.4f}]")
+    pred_F, logvar = model([x_test, t_test, c_test], training=False)
+    print(f"\nOutput shape: {pred_F.shape}  logvar shape: {logvar.shape}")
+    print(f"Output range: [{tf.reduce_min(pred_F):.4f}, {tf.reduce_max(pred_F):.4f}]")
     
     # Count parameters
     total_params = model.count_params()

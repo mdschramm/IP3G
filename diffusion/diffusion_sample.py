@@ -47,7 +47,7 @@ def _denoise_step(
     t_in = tf.concat([t_tensor, t_tensor], axis=0)
     labels_in = tf.concat([uncond_labels, cond_labels], axis=0)
 
-    eps_both = model([x_in, t_in, labels_in], training=False)
+    eps_both, _ = model([x_in, t_in, labels_in], training=False)
     eps_uncond = eps_both[:batch]
     eps_cond = eps_both[batch:]
     eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)

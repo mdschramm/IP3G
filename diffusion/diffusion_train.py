@@ -22,7 +22,6 @@ from diffusion.diffusion_config import get_config, print_config
 from diffusion.diffusion_model import build_unet
 import diffusion.diffusion_utils as diffusion_utils
 from preprocessing.filter_utils import filter_classes
-from diffusion.diffusion_ddim import sample_ddim_batch, noise_to_timestep
 
 
 class EMA:
@@ -153,16 +152,30 @@ def get_learning_rate_schedule(base_lr, warmup_steps, total_steps, schedule_kind
 
 
 @tf.function
-def train_step(model, x_noisy, timesteps, class_labels, true_noise, optimizer):
-    """Single training step — uniform MSE loss across all timesteps.
+def train_step(model, x_noisy, timesteps, class_labels, target_F, optimizer):
+    """EDM2 training step with preconditioning-cancelled unit-weight loss.
 
-    Keras 3 LossScaleOptimizer handles FP16 gradient scaling internally in
-    apply_gradients, so no mixed_precision flag is needed here.
+    Preconditioning (c_skip, c_out, c_in) is applied in the dataset so that
+    w(σ)·c_out²(σ)=1 exactly — the loss is plain MSE+logvar with no per-sample
+    weighting needed here. `target_F` is the preconditioned denoising target
+    computed by prepare_batch_conditional_edm.
     """
     with tf.GradientTape() as tape:
-        predicted_noise = model([x_noisy, timesteps, class_labels], training=True)
-        loss = tf.reduce_mean(tf.square(predicted_noise - tf.cast(true_noise, predicted_noise.dtype)))
-    gradients = tape.gradient(loss, model.trainable_weights)
+        pred_F, logvar = model([x_noisy, timesteps, class_labels], training=True)
+        # Reshape (no variables) inherits float16 compute dtype in Keras 3; re-cast here.
+        logvar = tf.cast(logvar, tf.float32)
+        target = tf.cast(target_F, pred_F.dtype)
+        mse    = tf.cast(tf.square(pred_F - target), tf.float32)
+        loss   = tf.reduce_mean(mse / tf.exp(logvar) + logvar)
+
+        # Scale loss INSIDE tape so gradients survive FP16's limited range.
+        scaled_loss = optimizer.scale_loss(loss) if hasattr(optimizer, 'scale_loss') else loss
+
+    gradients = tape.gradient(scaled_loss, model.trainable_weights)
+    gradients = [
+        tf.where(tf.math.is_finite(g), g, tf.zeros_like(g)) if g is not None else g
+        for g in gradients
+    ]
     optimizer.apply_gradients(zip(gradients, model.trainable_weights))
     return loss
 
@@ -223,18 +236,16 @@ def _collect_diag_step(model, probe_model, probe_names, x_noisy, timesteps, clas
 
 
 def _adagn_scale_stats(model):
-    """Estimate mean AdaGN scale and tanh saturation fraction across all blocks.
+    """Estimate mean AdaGN scale magnitude across all blocks.
 
     Feeds a unit-norm synthetic conditioning vector through each scale_shift_mlp
-    and computes 1 + tanh(scale_raw) per channel. This approximates the scale
-    magnitude the model applies at each AdaGN block, independent of the actual
-    conditioning input.
+    and computes mean |scale_raw| per block. With the tanh bounding removed,
+    scale_raw is the direct output; close to 0 is healthy (near-identity scale).
 
     Returns:
-        mean_scale: float — mean scale value across all channels and blocks.
-            Close to 1.0 is healthy (near-identity). Approaching 2.0 = saturated.
-        frac_saturated: float — fraction of (block, channel) pairs with scale > 1.8
-            (tanh_arg > ~1.1, i.e., in the flat tail where gradients are ~zero).
+        mean_scale: float — mean |scale_raw| across all channels and blocks.
+            Close to 0 is healthy. Growing past ~2 warrants attention.
+        frac_large: float — fraction of blocks where mean |scale_raw| > 2.
     """
     # Weights are at paths like res_net_block_N/ada_gn_M/dense_K/kernel.
     # Match ada_gn Dense layers inside res_net_blocks; exclude the time/class MLP.
@@ -262,11 +273,11 @@ def _adagn_scale_stats(model):
         scale_raw = tf.matmul(cond, K[:, :C])
         if (b := params.get('bias')) is not None:
             scale_raw = scale_raw + b[None, :C]
-        scale_means.append(float(tf.reduce_mean(1.0 + tf.tanh(scale_raw))))
+        scale_means.append(float(tf.reduce_mean(tf.abs(scale_raw))))
 
-    mean_scale      = float(np.mean(scale_means))
-    frac_saturated  = float(np.mean([s > 1.8 for s in scale_means]))
-    return mean_scale, frac_saturated
+    mean_scale     = float(np.mean(scale_means))
+    frac_large     = float(np.mean([s > 2.0 for s in scale_means]))  # fraction of blocks with mean |scale| > 2
+    return mean_scale, frac_large
 
 
 _FP16_MIN_NORMAL = 6.1e-5  # Smallest positive normal FP16 value
@@ -328,8 +339,13 @@ def _collect_grad_norms(model, x_noisy, timesteps, class_labels, true_noise, los
     y_s  = true_noise[:n]
 
     with tf.GradientTape() as tape:
-        pred = model([x_s, t_s, c_s], training=False)
-        loss = tf.reduce_mean(tf.square(pred - tf.cast(y_s, pred.dtype)))
+        pred, _ = model([x_s, t_s, c_s], training=False)
+        # Cast both sides to float32: pred may be float16 under mixed precision, and a
+        # float16 MSE loss readily underflows to 0 → tape.gradient(0, weights) = 0 everywhere,
+        # making grad_uflow and grad_p50 meaningless. Float32 loss gives real gradient magnitudes.
+        pred_f32 = tf.cast(pred, tf.float32)
+        y_f32    = tf.cast(y_s,  tf.float32)
+        loss     = tf.reduce_mean(tf.square(pred_f32 - y_f32))
     grads = tape.gradient(loss, model.trainable_weights)
 
     threshold = _FP16_MIN_NORMAL / max(float(loss_scale), 1.0)
@@ -341,10 +357,11 @@ def _collect_grad_norms(model, x_noisy, timesteps, class_labels, true_noise, los
             continue
         parts = w.path.split('/')
         group = parts[1] if len(parts) > 2 else parts[0]
-        g32 = tf.cast(g, tf.float32)
+        g32     = tf.cast(g, tf.float32)
+        abs_g32 = tf.abs(g32)
         group_norms.setdefault(group, []).append(float(tf.norm(g32)))
         group_uflow.setdefault(group, []).append(
-            float(tf.reduce_mean(tf.cast(tf.abs(g32) < threshold, tf.float32)))
+            float(tf.reduce_mean(tf.cast(abs_g32 < threshold, tf.float32)))
         )
 
     grad_norms     = {k: float(np.mean(v)) for k, v in group_norms.items()}
@@ -371,44 +388,35 @@ def _save_diag_history(history, path):
         flat[f'gnorm__{layer}'] = np.array(vals, dtype=np.float32)
     for layer, vals in history.get('grad_underflow', {}).items():
         flat[f'guflow__{layer}'] = np.array(vals, dtype=np.float32)
+    for layer, vals in history.get('weight_delta', {}).items():
+        flat[f'wdelta__{layer}'] = np.array(vals, dtype=np.float32)
     np.savez(path, **flat)
 
 
-def generate_samples(model, config, X_train, num_samples=16, guidance_scale=3.0):
+def generate_samples(model, config, num_samples=16, guidance_scale=3.0):
+    """Generate monitoring samples via the EDM Heun ODE sampler from pure noise.
+
+    No seed image required — starts from x ~ N(0, sigma_max²·I).
+    Uses 20 denoising steps (sufficient for monitoring; increase at inference time).
     """
-    Generate monitoring samples via DDIM, seeded from real training images.
-
-    Uses fixed seed indices so the grid is comparable across checkpoints.
-    t_start/t_end are taken from config['noise_timestep_range'], ensuring the
-    DDIM distribution matches the training distribution exactly.
-    """
-    ntr = config.get('noise_timestep_range', [1, config['timesteps']])
-    t_start, t_end = ntr[1], ntr[0]
-    num_classes = config['num_classes']
-    class_labels = (np.arange(num_samples) % num_classes).astype(np.int32)
-
-    # Fixed seed images so the monitoring grid is consistent across checkpoints
-    seed_indices = np.arange(num_samples) % len(X_train)
-    seed_images = X_train[seed_indices]  # [N, H, W]
-
-    # Forward-noise the seeds to t_start — same path as sample_ddim_batch uses internally
-    seed_norm = diffusion_utils.forward_transform(seed_images[..., np.newaxis]).numpy()
-    x_noisy, _ = noise_to_timestep(seed_norm, t_start)  # [N, H, W, 1]
-
-    samples = sample_ddim_batch(
-        model,
-        x_init=seed_images,
-        class_labels=class_labels,
-        num_classes=num_classes,
-        t_start=t_start,
-        t_end=t_end,
-        num_steps=20,          # fast for monitoring; increase at inference time
-        eta=0.0,               # deterministic — same seeds → same grid each checkpoint
-        guidance_scale=guidance_scale,
-        denormalize_output=False,  # keep in [0, 1] for grid display
-        eps_threshold=0.0,
+    from diffusion.diffusion_edm_sample import sample_edm_batch
+    sigmas = diffusion_utils.edm_sigma_schedule(
+        sigma_max=config['sigma_max'],
+        sigma_min=config['sigma_min'],
+        num_steps=20,
+        rho=config.get('sigma_rho', 7),
     )
-    return samples[..., 0], x_noisy[..., 0]  # both [N, H, W]
+    class_labels = (np.arange(num_samples) % config['num_classes']).astype(np.int32)
+    samples = sample_edm_batch(
+        model,
+        class_labels=class_labels,
+        num_classes=config['num_classes'],
+        sigmas=sigmas,
+        sigma_data=config['sigma_data'],
+        guidance_scale=guidance_scale,
+        image_size=config['image_size'],
+    )
+    return samples[..., 0]  # [N, H, W]
 
 
 def save_sample_grid(samples, step, output_dir, run_id='', seed_images=None):
@@ -533,14 +541,9 @@ def train(config, resume_from=None):
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
     diffusion_utils.save_norm_constants(norm_path)
 
-    # Initialize variance schedule (cosine or linear)
-    schedule_kind = config.get('variance_schedule', 'cosine')
-    alpha, alpha_cumprod, beta = diffusion_utils.init_schedule(config['timesteps'], kind=schedule_kind)
-    print(f"  Variance schedule: kind={schedule_kind}, T={config['timesteps']}, alpha_bar range=[{alpha_cumprod.min():.6f}, {alpha_cumprod.max():.6f}]")
-
-    # Create dataset
+    # Create EDM2 dataset — σ sampled from log-normal each batch, preconditioning applied inline
     print("\n🔄 Creating dataset...")
-    dataset = diffusion_utils.prepare_dataset_conditional(
+    dataset = diffusion_utils.prepare_dataset_conditional_edm(
         X_train,
         y_train,
         num_classes=config['num_classes'],
@@ -549,15 +552,17 @@ def train(config, resume_from=None):
         shuffle=True,
         drop_remainder=True,
         excluded_classes=config.get('excluded_classes', None),
-        timestep_range=config.get('noise_timestep_range', None),
+        P_mean=config.get('P_mean', -2.0),
+        P_std=config.get('P_std', 1.2),
+        sigma_min=config.get('sigma_min', 0.002),
+        sigma_max=config.get('sigma_max', 80.0),
+        sigma_data=float(config.get('sigma_data', 0.139)),
     )
     print(f"  Batch size: {config['batch_size']}")
     print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%")
+    print(f"  EDM σ sampling: P_mean={config.get('P_mean')}  P_std={config.get('P_std')}  σ∈[{config.get('sigma_min')}, {config.get('sigma_max')}]")
     if config.get('excluded_classes'):
         print(f"  Excluded classes: {config['excluded_classes']}")
-    if config.get('noise_timestep_range'):
-        ntr = config['noise_timestep_range']
-        print(f"  Noise timestep range: [{ntr[0]}, {ntr[1]}] (training on t ∈ [{ntr[0]}, {ntr[1]}])")
 
     # Build model
     print("\n🏗️  Building model...")
@@ -575,7 +580,7 @@ def train(config, resume_from=None):
         learning_rate=lr_schedule,
         weight_decay=0.01,
         beta_1=0.9,
-        beta_2=0.999,
+        beta_2=0.99,
         clipnorm=config['gradient_clip']
     )
     mixed_precision_enabled = config.get('mixed_precision', False)
@@ -599,6 +604,7 @@ def train(config, resume_from=None):
     diag_history = {
         'steps': [], 'weight_mean': {}, 'weight_max': {}, 'act_mean': {}, 'act_std': {},
         'gn_risk': {}, 'loss_scale': [], 'grad_norm': {}, 'grad_underflow': {},
+        'weight_delta': {},
     }
     if diag_interval < 999_999:
         print(f"  Diagnostic magnitude logging every {diag_interval} steps → {diag_path}")
@@ -632,19 +638,21 @@ def train(config, resume_from=None):
     print(f"  Save interval: {config['save_interval']:,}")
     print(f"  Sample interval: {config['sample_interval']:,}")
     print(f"  Log interval: {config['log_interval']:,}")
-    
+    print(f"  sigma_data: {config.get('sigma_data', 0.139)}")
+
     losses = []
     lrs = []
     step = start_step
     prev_checkpoint_path = None      # track for deletion after next save
     prev_diag_checkpoint_path = None # track diag rolling checkpoint for deletion
+    w_snapshot = {}                  # weight snapshots for per-diag-step delta tracking
 
     dataset_iter = iter(dataset.repeat())
-    
+
     while step < config['num_steps']:
         # Get batch
         inputs, true_noise = next(dataset_iter)
-        
+
         # Training step
         loss = train_step(
             model,
@@ -675,7 +683,19 @@ def train(config, resume_from=None):
                 diag_history['act_std'].setdefault(k, []).append(v)
 
             # FP16 precision diagnostics — zero-overhead GN risk + one extra backward pass
-            loss_scale = float(getattr(optimizer, 'loss_scale', 1.0))
+            # TF/Keras versions differ on the attribute name for the current loss scale.
+            # Try public then private names; stop at the first one that yields a float.
+            raw_ls = None
+            for _attr in ('loss_scale_factor', 'loss_scale', '_loss_scale', '_current_scale'):
+                _val = getattr(optimizer, _attr, None)
+                if _val is not None:
+                    try:
+                        raw_ls = float(_val)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        break
+            loss_scale = raw_ls if raw_ls is not None else 1.0
             gn_risks = _gn_precision_risks(a_mean, a_std)
             grad_norms, uflow_frac = _collect_grad_norms(
                 model, inputs['X_noisy'], inputs['timesteps'], inputs['class_labels'],
@@ -688,6 +708,20 @@ def train(config, resume_from=None):
                 diag_history['grad_norm'].setdefault(k, []).append(v)
             for k, v in uflow_frac.items():
                 diag_history['grad_underflow'].setdefault(k, []).append(v)
+
+            # Weight delta: mean |w_now - w_prev| per group since last diag step
+            w_delta_by_group = {}
+            for w in model.trainable_weights:
+                parts = w.path.split('/')
+                group = parts[1] if len(parts) > 2 else parts[0]
+                w32 = tf.cast(w, tf.float32).numpy()
+                prev = w_snapshot.get(w.path)
+                if prev is not None:
+                    w_delta_by_group.setdefault(group, []).append(float(np.mean(np.abs(w32 - prev))))
+                w_snapshot[w.path] = w32
+            w_delta_mean = {k: float(np.mean(v)) for k, v in w_delta_by_group.items()}
+            for k, v in w_delta_mean.items():
+                diag_history['weight_delta'].setdefault(k, []).append(v)
 
             _save_diag_history(diag_history, diag_path)
 
@@ -704,15 +738,16 @@ def train(config, resume_from=None):
 
             all_wm = list(w_mean.values())
             all_am = list(a_mean.values()) if a_mean else [float('nan')]
-            mean_scale, frac_sat = _adagn_scale_stats(model)
-            scale_str = f"  adagn_scale={mean_scale:.3f}  sat_frac={frac_sat:.2f}" if mean_scale is not None else ""
+            mean_scale, frac_large = _adagn_scale_stats(model)
+            scale_str = f"  adagn_|scale|={mean_scale:.3f}  large_frac={frac_large:.2f}" if mean_scale is not None else ""
             max_gn_risk  = max(gn_risks.values())  if gn_risks   else float('nan')
             mean_uflow   = np.mean(list(uflow_frac.values())) if uflow_frac else float('nan')
+            wdelta_str   = f"  mean_Δ|w|={np.mean(list(w_delta_mean.values())):.2e}" if w_delta_mean else "  mean_Δ|w|=n/a"
             print(
                 f"  [diag] mean_|w|={np.mean(all_wm):.4f}  max_|w|={max(w_max.values()):.4f}"
                 f"  mean_|act|={np.mean(all_am):.4f}{scale_str}"
-                f"  gn_risk={max_gn_risk:.3f}  loss_scale={loss_scale:.0f}  grad_uflow={mean_uflow:.3f}"
-                f"  ckpt→{os.path.basename(diag_ckpt)}"
+                f"  gn_risk={max_gn_risk:.3f}  loss_scale={loss_scale:.0f}(raw:{raw_ls})  grad_uflow={mean_uflow:.3f}"
+                f"{wdelta_str}  ckpt→{os.path.basename(diag_ckpt)}"
             )
 
         # Track metrics
@@ -748,8 +783,8 @@ def train(config, resume_from=None):
         if step % config['sample_interval'] == 0:
             print(f"  🎨 Generating samples...")
             ema.apply()  # Use EMA weights for generation
-            samples, seed_imgs = generate_samples(model, config, X_train, num_samples=16, guidance_scale=3.0)
-            save_sample_grid(samples, step, config['sample_dir'], run_id=run_id, seed_images=seed_imgs)
+            samples = generate_samples(model, config, num_samples=16, guidance_scale=3.0)
+            save_sample_grid(samples, step, config['sample_dir'], run_id=run_id)
             ema.restore()  # Restore training weights
     
     # Final save
