@@ -6,11 +6,13 @@ import csv
 import argparse
 from datetime import datetime
 
-RUN_MODE = os.environ.get("RUN_MODE", "local")
 PREPROCESSING_DIR = "output/preprocessing"
-CLASSIFIER_DIR = f"output/classifier/{RUN_MODE}"
-GAN_DIR = f"output/gan/{RUN_MODE}"
-DIFFUSION_DIR = f"output/diffusion/{RUN_MODE}"
+# Download remotely trained classifer
+CLASSIFIER_DIR = f"output/classifier/remote"
+# Download remotely trained GAN
+GAN_DIR = f"output/gan/remote"
+# Use diagnostic diffusion for comparison
+DIFFUSION_DIR = f"output/diffusion/diagnostic"
 FEATURE_FILE = "resized_expressions.npy"
 LABEL_FILE = "y_primary_disease_or_tissue.npy"
 
@@ -128,7 +130,7 @@ def evaluate_diffusion_map(feature_file=None, label_file=None, output_file=None,
         raise FileNotFoundError(
             f"Diffusion samples not found at {feat_path}.\n"
             f"Run diffusion_sample.py --generate-dataset first:\n"
-            f"  python -m diffusion.diffusion_sample --mode {RUN_MODE} "
+            f"  python -m diffusion.diffusion_sample --mode diagnostic "
             f"--checkpoint <path> --generate-dataset --guidance-scale {guidance_scale}"
         )
 

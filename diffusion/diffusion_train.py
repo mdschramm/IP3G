@@ -164,6 +164,9 @@ def train_step(model, x_noisy, timesteps, class_labels, target_F, optimizer):
         pred_F, logvar = model([x_noisy, timesteps, class_labels], training=True)
         # Reshape (no variables) inherits float16 compute dtype in Keras 3; re-cast here.
         logvar = tf.cast(logvar, tf.float32)
+        # Safety clamp: MPLinear-bounded logvar should stay in [-11, 11] by construction,
+        # but clamp defensively so a single bad batch cannot cause irreversible divergence.
+        logvar = tf.clip_by_value(logvar, -10.0, 5.0)
         target = tf.cast(target_F, pred_F.dtype)
         mse    = tf.cast(tf.square(pred_F - target), tf.float32)
         loss   = tf.reduce_mean(mse / tf.exp(logvar) + logvar)
@@ -685,16 +688,23 @@ def train(config, resume_from=None):
             # FP16 precision diagnostics — zero-overhead GN risk + one extra backward pass
             # TF/Keras versions differ on the attribute name for the current loss scale.
             # Try public then private names; stop at the first one that yields a float.
+            # Final fallback: scale_loss(1.0) returns the scale directly and works across
+            # all Keras versions (the attribute scan fails silently on Keras 3).
             raw_ls = None
             for _attr in ('loss_scale_factor', 'loss_scale', '_loss_scale', '_current_scale'):
                 _val = getattr(optimizer, _attr, None)
                 if _val is not None:
                     try:
                         raw_ls = float(_val)
-                    except (TypeError, ValueError):
+                    except Exception:
                         pass
                     else:
                         break
+            if raw_ls is None and hasattr(optimizer, 'scale_loss'):
+                try:
+                    raw_ls = float(optimizer.scale_loss(tf.constant(1.0, dtype=tf.float32)))
+                except Exception:
+                    pass
             loss_scale = raw_ls if raw_ls is not None else 1.0
             gn_risks = _gn_precision_risks(a_mean, a_std)
             grad_norms, uflow_frac = _collect_grad_norms(

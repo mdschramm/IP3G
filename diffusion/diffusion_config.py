@@ -52,6 +52,9 @@ CONFIG_LOCAL = {
     # FP16 safety
     'act_clip_magnitude': 256.0,          # Clamp encoder/decoder block outputs to ±this value (EDM2 §B)
 
+    # Logvar MLP (EDM2 §B.3): Fourier feature channels for the noise-level uncertainty head
+    'logvar_channels': 128,
+
     # Data
     'data_dir': 'output/preprocessing',
     'feature_file': 'resized_expressions.npy',
@@ -104,6 +107,9 @@ CONFIG_REMOTE = {
 
     # FP16 safety
     'act_clip_magnitude': 256.0,
+
+    # Logvar MLP
+    'logvar_channels': 128,
 
     # Data
     'data_dir': 'output/preprocessing',
@@ -160,6 +166,9 @@ CONFIG_DIAGNOSTIC = {
 
     # FP16 safety
     'act_clip_magnitude': 256.0,
+
+    # Logvar MLP
+    'logvar_channels': 128,
 
     # Data
     'data_dir': 'output/preprocessing',

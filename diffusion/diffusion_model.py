@@ -252,9 +252,14 @@ class SelfAttention(layers.Layer):
         
         # Reshape back: [B, H*W, C] → [B, H, W, C]
         h = tf.reshape(h, [batch, height, width, channels])
-        
-        return x + h  # Residual connection
-    
+
+        # Magnitude-preserving residual: (x + h) / sqrt(2).
+        # Plain x + h amplifies by sqrt(2) when x and h have equal magnitude (as at init),
+        # and grows with x when h has smaller magnitude (attention of GroupNorm output ≈ 1).
+        # Division by sqrt(2) preserves magnitude for uncorrelated equal-magnitude inputs,
+        # and attenuates when x >> h (stabilizing growth across layers).
+        return (x + h) * tf.cast(2.0 ** -0.5, x.dtype)
+
     def get_config(self):
         config = super().get_config()
         config.update({'num_heads': self.num_heads})
@@ -331,7 +336,7 @@ class SparseSelfAttention(layers.Layer):
 
         # Reshape back: [B, H*W, C] -> [B, H, W, C]
         attended = tf.reshape(attended, [batch, height, width, channels])
-        return x + attended  # residual connection (same as dense version)
+        return (x + attended) * tf.cast(2.0 ** -0.5, x.dtype)  # magnitude-preserving residual
 
     def get_config(self):
         config = super().get_config()
@@ -547,10 +552,58 @@ class MPSiLU(layers.Layer):
         return super().get_config()
 
 
+class MPFourier(layers.Layer):
+    """Fixed random Fourier features for a scalar input (EDM2 §B.3).
+
+    Maps a scalar c_noise = ln(σ)/4 to a fixed random feature vector:
+        y = cos(x · freqs + phases) · sqrt(2)
+
+    Frequencies and phases are sampled once at build time and are NOT trained.
+    The sqrt(2) factor makes E[y²]=1 for any input distribution, so the feature
+    vector is magnitude-preserving regardless of the input range.
+
+    Used by the logvar branch to give it a rich, noise-level-dependent feature
+    without coupling it to the spatial decoder activations.
+    """
+
+    def __init__(self, num_channels, bandwidth=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.num_channels = num_channels
+        self.bandwidth = float(bandwidth)
+
+    def build(self, input_shape):
+        freqs_init = (2 * np.pi * np.random.randn(self.num_channels) * self.bandwidth).astype(np.float32)
+        phases_init = (2 * np.pi * np.random.uniform(size=self.num_channels)).astype(np.float32)
+        self.freqs  = self.add_weight(shape=(self.num_channels,),
+                                      initializer=tf.keras.initializers.Constant(freqs_init),
+                                      trainable=False, name='freqs',  dtype=tf.float32)
+        self.phases = self.add_weight(shape=(self.num_channels,),
+                                      initializer=tf.keras.initializers.Constant(phases_init),
+                                      trainable=False, name='phases', dtype=tf.float32)
+        super().build(input_shape)
+
+    def call(self, x):
+        # Explicitly cast to float32: Keras mixed-precision policy auto-casts non-trainable
+        # weights to the global compute dtype (float16) inside call(). Without explicit casts
+        # x_f32 (float32) * self.freqs (float16) produces a dtype-mismatch error.
+        x_f32     = tf.cast(x,           tf.float32)  # [B]
+        freqs_f32 = tf.cast(self.freqs,  tf.float32)  # [num_channels]
+        phases_f32= tf.cast(self.phases, tf.float32)  # [num_channels]
+        y = x_f32[:, None] * freqs_f32[None, :]       # [B, num_channels]
+        y = y + phases_f32[None, :]
+        y = tf.cos(y) * tf.cast(np.sqrt(2), tf.float32)
+        return y                                       # [B, num_channels], float32
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'num_channels': self.num_channels, 'bandwidth': self.bandwidth})
+        return cfg
+
+
 def build_unet(config):
     """
     Build conditional U-Net model for DDPM.
-    
+
     Args:
         config: Configuration dictionary with model parameters
         
@@ -613,11 +666,18 @@ def build_unet(config):
     h = _make_attention(num_heads, use_sparse_attention, sparse_top_k_frac)(h)
     h = ResNetBlock(channels[-1], dropout, res_balance=res_balance)([h, conditioning])
 
-    # Logvar head (EDM2 uncertainty loss) — branches off bottleneck before decoder.
-    # GlobalAveragePooling collapses spatial dims; Dense produces one scalar per sample.
-    logvar = layers.GlobalAveragePooling2D()(h)
-    logvar = layers.Dense(1, dtype='float32')(logvar)  # [B, 1]
-    logvar = layers.Reshape((1, 1, 1))(logvar)         # [B, 1, 1, 1] — broadcasts over H×W×C
+    # Logvar head — EDM2 §B.3 / §5: a separate MLP that takes only c_noise (t_input),
+    # NOT the spatial bottleneck features. This is critical: logvar should depend on the
+    # noise level σ alone, not on spatial content. Branching from bottleneck features
+    # entangles logvar with the main prediction, causing Adam to overshoot logvar negative
+    # near peak LR and producing mse/exp(logvar) → 1e8.
+    #
+    # Architecture: MPFourier(c_noise) → fixed random Fourier features → MPLinear → scalar
+    # MPLinear keeps weight norm = 1, so logvar output is bounded by ||fourier_features||₂.
+    logvar_channels = config.get('logvar_channels', 128)
+    logvar = MPFourier(logvar_channels)(t_input)          # [B, logvar_channels], float32
+    logvar = MPLinear(1)(logvar)                          # [B, 1], float32
+    logvar = layers.Reshape((1, 1, 1))(logvar)            # [B, 1, 1, 1] — broadcasts over H×W×C
 
     # Decoder
     for level in reversed(range(len(channels))):
