@@ -44,7 +44,7 @@ def initialize_dataset():
 
     # Create tf.data.Dataset.
     dataset = tf.data.Dataset.from_tensor_slices((x_train))
-    dataset = dataset.shuffle(buffer_size=1024).batch(BATCH_SIZE)
+    dataset = dataset.shuffle(buffer_size=1024).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
     print(f"Shape of training images: {x_train.shape}")
     return dataset
@@ -81,19 +81,19 @@ def get_generator_model():
   x = layers.LeakyReLU(alpha=0.2)(x)
   x = layers.Reshape((8, 8, LATENT_DIM+C_CAT_DIM))(x)
   x = layers.Conv2DTranspose(128, (3, 3), strides=(2, 2), padding="same",use_bias=False)(x)
-  x = layers.BatchNormalization()(x)
+  x = layers.BatchNormalization(dtype='float32')(x)
   x = layers.LeakyReLU(alpha=0.2)(x)
   x = layers.Conv2DTranspose(128, (3, 3), strides=(2, 2), padding="same",use_bias=False)(x)
-  x = layers.BatchNormalization()(x)
+  x = layers.BatchNormalization(dtype='float32')(x)
   x = layers.LeakyReLU(alpha=0.2)(x)
   x = layers.Conv2DTranspose(128, (5, 5), strides=(2, 2), padding="same",use_bias=False)(x)
-  x = layers.BatchNormalization()(x)
+  x = layers.BatchNormalization(dtype='float32')(x)
   x = layers.LeakyReLU(alpha=0.2)(x)
   x = layers.Conv2DTranspose(128, (7, 7), strides=(2, 2), padding="same",use_bias=False)(x)
-  x = layers.BatchNormalization()(x)
+  x = layers.BatchNormalization(dtype='float32')(x)
   x = layers.LeakyReLU(alpha=0.2)(x)
   x = layers.Conv2D(1, (7, 7), padding="same",use_bias=False)(x)
-  x = layers.BatchNormalization()(x)
+  x = layers.BatchNormalization(dtype='float32')(x)
   x = layers.Activation('tanh',name='gen_out')(x)
   g_model = keras.models.Model([noise,labels], x, name="generator")
   return g_model
@@ -117,7 +117,7 @@ class WINFOGAN(keras.Model):
         return [self.gen_loss_tracker, self.disc_loss_tracker]
 
     def compile(self, d_optimizer, g_optimizer,q_optimizer, d_loss_fn, g_loss_fn, q_loss_fn):
-        super(WINFOGAN, self).compile(jit_compile=False)
+        super(WINFOGAN, self).compile(jit_compile=(RUN_MODE != "local"))
         self.d_optimizer = d_optimizer
         self.g_optimizer = g_optimizer
         self.q_optimizer = q_optimizer
@@ -130,23 +130,26 @@ class WINFOGAN(keras.Model):
 
         This loss is calculated on an interpolated image
         and added to the discriminator loss.
+
+        Interpolation and gradient norm stay in float32: in FP16 small gradients
+        underflow to zero, making the penalty meaningless. Only the discriminator
+        forward pass uses the model's compute dtype (FP16 under mixed precision).
         """
-        # Get the interpolated image
+        real_f32 = tf.cast(real_images, tf.float32)
+        fake_f32 = tf.cast(fake_images, tf.float32)
         alpha = tf.random.normal([batch_size, 1, 1, 1], 0.0, 1.0)
-        diff = fake_images - real_images
-        interpolated = real_images + alpha * diff
+        interpolated = real_f32 + alpha * (fake_f32 - real_f32)  # float32
 
         with tf.GradientTape() as gp_tape:
             gp_tape.watch(interpolated)
-            # 1. Get the discriminator output for this interpolated image.
-            pred = self.discriminator(interpolated, training=True)
+            pred = self.discriminator(
+                tf.cast(interpolated, real_images.dtype), training=True
+            )
+            pred = tf.cast(pred, tf.float32)
 
-        # 2. Calculate the gradients w.r.t to this interpolated image.
-        grads = gp_tape.gradient(pred, [interpolated])[0]
-        # 3. Calculate the norm of the gradients.
-        norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]))
-        gp = tf.reduce_mean((norm - 1.0) ** 2)
-        return gp
+        grads = tf.cast(gp_tape.gradient(pred, [interpolated])[0], tf.float32)
+        norm = tf.sqrt(tf.reduce_sum(tf.square(grads), axis=[1, 2, 3]) + 1e-8)
+        return tf.reduce_mean((norm - 1.0) ** 2)
 
     def train_step(self, data):
         # Unpack the data.
@@ -176,12 +179,16 @@ class WINFOGAN(keras.Model):
               d_cost = self.d_loss_fn(real_img=real_logits, fake_img=fake_logits)
               # Calculate the gradient penalty
               gp = self.gradient_penalty(batch_size, real_images, fake_images)
-              # Add the gradient penalty to the original discriminator loss
-              d_loss = d_cost + gp * self.gp_weight
+              # Cast d_cost to float32: discriminator outputs float16 under mixed precision,
+              # but gp is computed in float32 (see gradient_penalty). Both must match.
+              d_loss = tf.cast(d_cost, tf.float32) + gp * self.gp_weight
+              # scale_loss must be inside the tape so the scaling op is part of the recorded graph
+              scaled_d_loss = self.d_optimizer.scale_loss(d_loss) if hasattr(self.d_optimizer, 'scale_loss') else d_loss
 
           # Get the gradients w.r.t the discriminator loss
-          d_gradient = tape.gradient(d_loss, self.discriminator.trainable_variables)
+          d_gradient = tape.gradient(scaled_d_loss, self.discriminator.trainable_variables)
           # Update the weights of the discriminator using the discriminator optimizer
+          # LossScaleOptimizer.apply_gradients unscales automatically in Keras 3
           self.d_optimizer.apply_gradients(
               zip(d_gradient, self.discriminator.trainable_variables)
           )
@@ -191,36 +198,41 @@ class WINFOGAN(keras.Model):
         random_latent_vectors = tf.random.normal(shape=(batch_size, self.latent_dim))
         indx = tf.random.uniform(shape=(batch_size,), minval=0, maxval=C_CAT_DIM, dtype=tf.int32)
         labels = tf.one_hot(indx , C_CAT_DIM)
-        
+
         with tf.GradientTape() as g_tape, tf.GradientTape() as qn_tape:
             self.discriminator.trainable = False
-            
+
             # NOt needed as gradienttape automatically records the trainable variables
             # g_tape.watch(self.generator.trainable_variables)
             # qn_tape.watch(self.q_network.trainable_variables)
-            
+
             # Generate fake images using the generator
             generated_images = self.generator([random_latent_vectors,labels], training=True)
             # Get the discriminator logits for fake images
             gen_img_logits = self.discriminator(generated_images, training=True)
-            
+
             cat_output = self.q_network(generated_images, training=True)
             cat_loss = self.q_loss_fn(labels , cat_output)
-            
+
             # Calculate the generator loss
-            g_loss = self.g_loss_fn(gen_img_logits) + cat_loss
+            # Cast to float32: gen_img_logits is float16 (discriminator output under mixed
+            # precision), so g_loss_fn returns float16, but cat_loss from
+            # CategoricalCrossentropy is float32. Both must match before adding.
+            g_loss = tf.cast(self.g_loss_fn(gen_img_logits), tf.float32) + tf.cast(cat_loss, tf.float32)
+            # scale_loss must be inside the tape (same reason as discriminator above)
+            scaled_g_loss = self.g_optimizer.scale_loss(g_loss) if hasattr(self.g_optimizer, 'scale_loss') else g_loss
+            scaled_cat_loss = self.q_optimizer.scale_loss(cat_loss) if hasattr(self.q_optimizer, 'scale_loss') else cat_loss
 
         # Get the gradients w.r.t the generator loss
-        gen_gradient = g_tape.gradient(g_loss, self.generator.trainable_variables)
+        gen_gradient = g_tape.gradient(scaled_g_loss, self.generator.trainable_variables)
         # Update the weights of the generator using the generator optimizer
         self.g_optimizer.apply_gradients(
             zip(gen_gradient, self.generator.trainable_variables)
         )
-        
-        
-        qn_gradinet = qn_tape.gradient(cat_loss , self.q_network.trainable_variables)
+
+        qn_gradinet = qn_tape.gradient(scaled_cat_loss, self.q_network.trainable_variables)
         self.q_optimizer.apply_gradients(
-            zip(qn_gradinet , self.q_network.trainable_variables))
+            zip(qn_gradinet, self.q_network.trainable_variables))
 
         # Monitor loss.
         self.gen_loss_tracker.update_state(g_loss)
@@ -384,13 +396,20 @@ def save_gan_components(info_gan):
 
 def compile_info_gan(g_model, d_model, q_network):
     print("Compiling InfoGAN")
+    d_opt = keras.optimizers.Adam(learning_rate=0.0003, beta_1=0.5, beta_2=0.9)
+    g_opt = keras.optimizers.Adam(learning_rate=0.0003, beta_1=0.5, beta_2=0.9)
+    q_opt = keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.5, beta_2=0.9)
+    if RUN_MODE != "local":
+        d_opt = keras.mixed_precision.LossScaleOptimizer(d_opt)
+        g_opt = keras.mixed_precision.LossScaleOptimizer(g_opt)
+        q_opt = keras.mixed_precision.LossScaleOptimizer(q_opt)
     info_gan = WINFOGAN(
         discriminator=d_model, generator=g_model, q_network=q_network, latent_dim=LATENT_DIM
     )
     info_gan.compile(
-        d_optimizer=keras.optimizers.Adam(learning_rate=0.0003,beta_1=0.5, beta_2=0.9),
-        g_optimizer=keras.optimizers.Adam(learning_rate=0.0003,beta_1=0.5, beta_2=0.9),
-        q_optimizer=keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.5, beta_2=0.9),
+        d_optimizer=d_opt,
+        g_optimizer=g_opt,
+        q_optimizer=q_opt,
         g_loss_fn=generator_loss,
         d_loss_fn=discriminator_loss,
         q_loss_fn=keras.losses.CategoricalCrossentropy()
@@ -560,6 +579,10 @@ if __name__ == "__main__":
     if args.refresh and not args.train:
         parser.error("--refresh can only be used with --train")
     
+    if RUN_MODE != "local":
+        keras.mixed_precision.set_global_policy('mixed_float16')
+        print("Mixed precision enabled (FP16)")
+
     os.makedirs(DATA_DIR, exist_ok=True)
 
     info_gan = None
