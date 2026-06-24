@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
-
-
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import BatchNormalization
 from tensorflow.keras.layers import Conv2D
@@ -138,11 +135,11 @@ if __name__ == "__main__":
     x_train, x_val, y_train, y_val, num_classes = load_data(f"{PREPROCESSING_DIR}/{FEATURE_FILE}", f"{PREPROCESSING_DIR}/{LABEL_FILE}")
     model = get_model(num_classes)
     print(model.summary())
-    # load_model = False
-    # if load_model:
-    #     model = tf.keras.models.load_model(f"{DATA_DIR}/{MODEL_OUTPUT_FILE}")
-    # else:
-    #     hist = train_model(model, x_train, y_train, x_val, y_val)
-    #     save_model(model)
-    #     plot_history(hist)
+    load_model = False
+    if load_model:
+        model = tf.keras.models.load_model(f"{DATA_DIR}/{MODEL_OUTPUT_FILE}")
+    else:
+        hist = train_model(model, x_train, y_train, x_val, y_val)
+        save_model(model)
+        plot_history(hist)
     # evaluate_model(model, x_train, y_train, x_val, y_val)
