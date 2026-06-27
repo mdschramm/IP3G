@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+import argparse
+
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import BatchNormalization
 from tensorflow.keras.layers import Conv2D
@@ -131,15 +133,29 @@ def save_model(model, file_path=f"{DATA_DIR}/{MODEL_OUTPUT_FILE}", weights_only=
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Train Conditional DDPM with Classifier-Free Guidance',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=""""""
+    )
+    parser.add_argument(
+        '--load-model',
+        type=str,
+        choices=["yes", "no"],
+        default='no',
+        help='Load model from checkpoint'
+    )
+
     os.makedirs(DATA_DIR, exist_ok=True)
     x_train, x_val, y_train, y_val, num_classes = load_data(f"{PREPROCESSING_DIR}/{FEATURE_FILE}", f"{PREPROCESSING_DIR}/{LABEL_FILE}")
     model = get_model(num_classes)
-    print(model.summary())
-    load_model = False
+    model.summary()
+
+    load_model = True if parser.parse_args().load_model.lower() == "yes" else False
     if load_model:
         model = tf.keras.models.load_model(f"{DATA_DIR}/{MODEL_OUTPUT_FILE}")
     else:
         hist = train_model(model, x_train, y_train, x_val, y_val)
         save_model(model)
         plot_history(hist)
-    # evaluate_model(model, x_train, y_train, x_val, y_val)
+    evaluate_model(model, x_train, y_train, x_val, y_val)

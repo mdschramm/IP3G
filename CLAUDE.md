@@ -53,7 +53,7 @@ Slash commands available in Claude Code: `/deploy`, `/train`, `/logs`, `/sync`, 
 - Output dirs: `output/{module}/{local|remote}/`
 - Preprocessing output: `output/preprocessing/` (no local/remote split — shared input)
 - Mixed precision: disabled locally (M1 Metal), enabled remotely (A100)
-- `jit_compile=False` on GAN compile — disables XLA JIT to fix Metal GPU crash; no effect on A100
+- `jit_compile=False` on GAN compile — disables XLA JIT; required on both Metal and A100. Enabling it under mixed_float16 on A100 causes mode collapse at ~epoch 663 (XLA op fusion changes float16 numerical trajectory).
 
 ## Important Notes
 

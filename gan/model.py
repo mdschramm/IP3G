@@ -18,6 +18,7 @@ NUM_CHANNELS = 1
 BATCH_SIZE = 64
 IMAGE_SIZE = 128
 EPOCHS = 1000
+D_STEPS = 5  # discriminator gradient updates per generator update
 RUN_MODE = os.environ.get("RUN_MODE", "local")
 
 EXCLUDED_CLASSES = [6, 24, 25, 31]
@@ -109,7 +110,7 @@ class WINFOGAN(keras.Model):
         self.gen_loss_tracker = keras.metrics.Mean(name="generator_loss")
         self.disc_loss_tracker = keras.metrics.Mean(name="discriminator_loss")
         self.q_loss_tracker = keras.metrics.Mean(name="q_loss")
-        self.d_steps = 5
+        self.d_steps = D_STEPS
         self.gp_weight = 100
 
     @property
@@ -117,7 +118,7 @@ class WINFOGAN(keras.Model):
         return [self.gen_loss_tracker, self.disc_loss_tracker]
 
     def compile(self, d_optimizer, g_optimizer,q_optimizer, d_loss_fn, g_loss_fn, q_loss_fn):
-        super(WINFOGAN, self).compile(jit_compile=(RUN_MODE != "local"))
+        super(WINFOGAN, self).compile(jit_compile=False)
         self.d_optimizer = d_optimizer
         self.g_optimizer = g_optimizer
         self.q_optimizer = q_optimizer
@@ -268,16 +269,28 @@ class GANMonitor(tf.keras.callbacks.Callback):
 
         # Combine the noise and the labels and run inference with the generator.
         fake_images = self.model.generator.predict([_noise, _label])
+
+        # Generator health: std → 0 is the first sign of mode collapse
+        raw_std = np.std(fake_images)
+        raw_min = float(fake_images.min())
+        raw_max = float(fake_images.max())
+        print(f"  Generator output — min: {raw_min:.3f}  max: {raw_max:.3f}  std: {raw_std:.4f}")
+
+        # Loss scale per optimizer — halvings mean float16 gradient overflow
+        if hasattr(self.model.d_optimizer, 'loss_scale'):
+            print(f"  Loss scales     — d: {self.model.d_optimizer.loss_scale:.0f}"
+                  f"  g: {self.model.g_optimizer.loss_scale:.0f}"
+                  f"  q: {self.model.q_optimizer.loss_scale:.0f}")
+
         fake_images = fake_images * 0.5 + 0.5
         fake_images *= 255.0
         converted_images = fake_images.astype(np.uint8)
         converted_images = tf.image.resize(converted_images, (256, 256)).numpy().astype(np.uint8)
 
-
         for i in range(4):
           plt.subplot(2,2,i+1)
           plt.imshow(converted_images[i][:,:,0],cmap='gray')
-        
+
         # Save to gan_monitor_images subfolder
         output_dir = os.path.join(DATA_DIR, "gan_monitor_images")
         os.makedirs(output_dir, exist_ok=True)
@@ -400,7 +413,11 @@ def compile_info_gan(g_model, d_model, q_network):
     g_opt = keras.optimizers.Adam(learning_rate=0.0003, beta_1=0.5, beta_2=0.9)
     q_opt = keras.optimizers.Adam(learning_rate=0.0001, beta_1=0.5, beta_2=0.9)
     if RUN_MODE != "local":
-        d_opt = keras.mixed_precision.LossScaleOptimizer(d_opt)
+        # dynamic_growth_steps scaled by D_STEPS so the discriminator's loss scale
+        # doubles at the same effective rate as the generator's (which gets 1 update
+        # per train_step vs D_STEPS updates for the discriminator).
+        # To reproduce the regression quickly, set dynamic_growth_steps=1 temporarily.
+        d_opt = keras.mixed_precision.LossScaleOptimizer(d_opt, dynamic_growth_steps=2000 * D_STEPS)
         g_opt = keras.mixed_precision.LossScaleOptimizer(g_opt)
         q_opt = keras.mixed_precision.LossScaleOptimizer(q_opt)
     info_gan = WINFOGAN(
