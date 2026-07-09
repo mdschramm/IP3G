@@ -203,6 +203,42 @@ def get_y_train(phenotypes):
   return y_train
 
 
+def print_class_label_mapping(y_file_path):
+  """
+  Print the mapping from class label index (e.g. "class 40") to the
+  phenotype value it corresponds to, for a one-hot label file produced
+  by get_y_train (y_primary_disease_or_tissue.npy or y_primary_site.npy).
+
+  The class index for a label is determined in get_y_train by
+  sorted(set(phenotypes)), so this reloads the same per-sample phenotypes
+  array used to build the y file and re-derives that sorted order.
+
+  Args:
+    y_file_path: Path to y_primary_disease_or_tissue.npy or y_primary_site.npy
+      (as saved by preprocessing.prepare_training_data)
+  """
+  filename = os.path.basename(y_file_path)
+  if "primary_disease_or_tissue" in filename:
+    phenotypes_path = f"{BASE_DATA_DIR}/sample_body_site_phenotypes.npy"
+  elif "primary_site" in filename:
+    phenotypes_path = f"{BASE_DATA_DIR}/sample_primary_site_phenotypes.npy"
+  else:
+    raise ValueError(f"Unrecognized y label file: {filename}")
+
+  y = np.load(y_file_path)
+  phenotypes = np.load(phenotypes_path)
+  set_labels = sorted(set(phenotypes))
+
+  if len(set_labels) != y.shape[1]:
+    raise ValueError(
+      f"Mismatch: {phenotypes_path} has {len(set_labels)} unique phenotypes "
+      f"but {y_file_path} has {y.shape[1]} classes. Cached files may be out of sync."
+    )
+
+  for i, label in enumerate(set_labels):
+    print(f"class {i}: {label}")
+
+
 if __name__ == "__main__":
   import os
   os.makedirs(BASE_DATA_DIR, exist_ok=True)

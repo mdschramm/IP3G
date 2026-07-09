@@ -10,7 +10,7 @@ Usage:
         --samples output/diffusion/diagnostic/samples/diffusion_synthetic_expressions_w3.0.npy \\
         --labels  output/diffusion/diagnostic/samples/diffusion_synthetic_labels_w3.0.npy \\
         --out     output/diffusion/diagnostic/samples/preview_w3.0.png \\
-        --n-classes 16 --n-per-class 4
+        --n-classes 16 --n-per-class 4 --classes 0,23
 """
 
 import argparse
@@ -29,6 +29,7 @@ def visualize_diffusion_samples(
     n_per_class=4,
     seed=0,
     guidance_scale=None,
+    classes=None,
 ):
     rng = np.random.default_rng(seed)
 
@@ -38,7 +39,10 @@ def visualize_diffusion_samples(
     print(f"Samples: {X.shape}  range=[{X.min():.3f}, {X.max():.3f}]")
     print(f"Classes present: {len(np.unique(y))}")
 
-    classes = sorted(np.unique(y))[:n_classes]
+    if classes is not None:
+        classes = [c for c in classes if c in np.unique(y)]
+    else:
+        classes = sorted(np.unique(y))[:n_classes]
     n_rows = len(classes)
     n_cols = n_per_class
 
@@ -98,7 +102,11 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--guidance-scale", type=str, default=None,
                    help="Guidance scale label for title (inferred from filename if omitted)")
+    p.add_argument("--classes", type=str, default=None,
+                   help="Comma-separated class indices to visualize, e.g. '0,5,23,38' (overrides --n-classes)")
     args = p.parse_args()
+
+    classes = [int(c) for c in args.classes.split(",")] if args.classes else None
 
     visualize_diffusion_samples(
         samples_path=args.samples,
@@ -108,4 +116,5 @@ if __name__ == "__main__":
         n_per_class=args.n_per_class,
         seed=args.seed,
         guidance_scale=args.guidance_scale,
+        classes=classes,
     )

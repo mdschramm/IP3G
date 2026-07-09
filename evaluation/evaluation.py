@@ -6,6 +6,8 @@ import csv
 import argparse
 from datetime import datetime
 
+RUN_MODE = os.environ.get("RUN_MODE", "local")
+
 PREPROCESSING_DIR = "output/preprocessing"
 # Download remotely trained classifer
 CLASSIFIER_DIR = f"output/classifier/remote"
@@ -16,7 +18,7 @@ DIFFUSION_DIR = f"output/diffusion/diagnostic"
 FEATURE_FILE = "resized_expressions.npy"
 LABEL_FILE = "y_primary_disease_or_tissue.npy"
 
-MODEL_WEIGHTS = "classifier_weights_only.keras"
+CLASSIFIER_WEIGHTS_FILE = "classifier_weights_only.keras"
 
 """
 # Confidence Evaluation
@@ -46,7 +48,7 @@ def map_latent_to_phenotype(latent_feature_file, latent_label_file, output_file=
     y_latent = np.load(latent_label_file)
     
     # Load trained classifier
-    weights_path = f"{CLASSIFIER_DIR}/classifier_weights_only.keras"
+    weights_path = f"{CLASSIFIER_DIR}/{CLASSIFIER_WEIGHTS_FILE}"
     model = tf.keras.models.load_model(
         weights_path,
         custom_objects={'precision_m': precision_m, 'recall_m': recall_m, 'f1_m': f1_m}
@@ -140,7 +142,7 @@ def evaluate_diffusion_map(feature_file=None, label_file=None, output_file=None,
     if X_synthetic.ndim == 3:
         X_synthetic = X_synthetic[..., np.newaxis]  # [N, H, W] → [N, H, W, 1]
 
-    weights_path = f"{CLASSIFIER_DIR}/classifier_weights_only.keras"
+    weights_path = f"{CLASSIFIER_DIR}/{CLASSIFIER_WEIGHTS_FILE}"
     model = tf.keras.models.load_model(
         weights_path,
         custom_objects={'precision_m': precision_m, 'recall_m': recall_m, 'f1_m': f1_m}
@@ -202,7 +204,7 @@ def evaluate_accuracy(feature_file=None, label_file=None):
 
     x_train, x_val, y_train, y_val, num_classes = load_data(feat_path, label_path)
 
-    weights_path = f"{CLASSIFIER_DIR}/{MODEL_WEIGHTS}"
+    weights_path = f"{CLASSIFIER_DIR}/{CLASSIFIER_WEIGHTS_FILE}"
     model = tf.keras.models.load_model(
         weights_path,
         custom_objects={'precision_m': precision_m, 'recall_m': recall_m, 'f1_m': f1_m}
@@ -214,6 +216,59 @@ def evaluate_accuracy(feature_file=None, label_file=None):
     print("\nValidation set evaluation:")
     model.evaluate(x_val, y_val)
 
+def evaluate_per_class_accuracy(feature_file=None, label_file=None, output_file=None):
+    """
+    Print classifier accuracy per class on loaded dataset
+    """
+    feat_path = feature_file if feature_file else f"{PREPROCESSING_DIR}/{FEATURE_FILE}"
+    label_path = label_file if label_file else f"{PREPROCESSING_DIR}/{LABEL_FILE}"
+
+    x_train, x_val, y_train, y_val, num_classes = load_data(feat_path, label_path)
+
+    weights_path = f"{CLASSIFIER_DIR}/{CLASSIFIER_WEIGHTS_FILE}"
+    model = tf.keras.models.load_model(
+        weights_path,
+        custom_objects={'precision_m': precision_m, 'recall_m': recall_m, 'f1_m': f1_m}
+    )
+    print(f"Loaded weights from {weights_path}")
+
+    X = np.concatenate([x_train, x_val], axis=0)
+    y = np.concatenate([y_train, y_val], axis=0)
+
+    predictions = model.predict(X, verbose=0)
+    predicted_classes = np.argmax(predictions, axis=1)
+    true_classes = np.argmax(y, axis=1)
+
+    results = []
+    for i in range(num_classes):
+        class_mask = true_classes == i
+        n_samples = int(np.sum(class_mask))
+        if n_samples == 0:
+            print(f"Class {i:2d}: No samples found")
+            continue
+
+        accuracy = np.mean(predicted_classes[class_mask] == i)
+        print(f"Class {i:2d}: accuracy={accuracy:.4f}, n_samples={n_samples}")
+
+        results.append({
+            'class': i,
+            'accuracy': round(float(accuracy), 4),
+            'n_samples': n_samples
+        })
+
+    overall_accuracy = np.mean(predicted_classes == true_classes)
+    print(f"\nOverall accuracy: {overall_accuracy*100:.2f}%")
+
+    if output_file:
+        with open(output_file, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=['class', 'accuracy', 'n_samples'])
+            writer.writeheader()
+            writer.writerows(results)
+        print(f"Results saved to {output_file}")
+
+    return results
+
+
 def evaluate_confidence(output_file=None, feature_file=None, label_file=None):
     # Use provided files or defaults
     feat_path = feature_file if feature_file else f"{PREPROCESSING_DIR}/{FEATURE_FILE}"
@@ -221,7 +276,7 @@ def evaluate_confidence(output_file=None, feature_file=None, label_file=None):
 
     x_train, x_val, y_train, y_val, num_classes = load_data(feat_path, label_path)
 
-    weights_path = f"{CLASSIFIER_DIR}/classifier_weights_only.keras"
+    weights_path = f"{CLASSIFIER_DIR}/{CLASSIFIER_WEIGHTS_FILE}"
     model = tf.keras.models.load_model(
         weights_path,
         custom_objects={'precision_m': precision_m, 'recall_m': recall_m, 'f1_m': f1_m}
@@ -276,7 +331,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--mode',
         type=str,
-        choices=['accuracy', 'confidence', 'map'],
+        choices=['accuracy', 'confidence', 'map', "class-accuracy"],
         default='accuracy',
         help='Evaluation mode: accuracy, confidence, or map (default: accuracy)'
     )
@@ -315,6 +370,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Classifier was saved on A100 (CUDA); Metal GPU can't execute its compiled ops locally.
+    if RUN_MODE == "local":
+        tf.config.set_visible_devices([], 'GPU')
+
     if args.mode == 'map':
         if args.source == 'diffusion':
             evaluate_diffusion_map(
@@ -345,3 +404,11 @@ if __name__ == "__main__":
             feature_file=args.feature_file,
             label_file=args.label_file
         )
+    elif args.mode == "class-accuracy":
+        evaluate_per_class_accuracy(
+            feature_file=args.feature_file,
+            label_file=args.label_file,
+            output_file=args.output
+        )
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}. Use 'accuracy', 'confidence', 'map', or 'class-accuracy'.")

@@ -88,7 +88,7 @@ def get_class_stats():
     Median class size: 109.5
     """
 
-def show_example_images_from_each_class(n=6):
+def show_example_images_from_each_class(n=4, selected_classes=None):
     # Create evaluation/explore if doesn't already exist
     if not os.path.exists('evaluation/explore'):
         os.makedirs('evaluation/explore')
@@ -100,17 +100,22 @@ def show_example_images_from_each_class(n=6):
     excluded_classes = [6, 24, 25, 31]
     for cls in unique:
         if cls in excluded_classes: continue
+        if selected_classes is not None and cls not in selected_classes: continue
         idx = np.where(y == cls)[0]
         idx = np.random.choice(idx, n, replace=False)
         # Group classes into multi-plot
-        fig, axes = plt.subplots(1, n, figsize=(15, 3))
-        for i, ax in enumerate(axes):
-            ax.imshow(x[idx[i]], cmap='gray')
+        n_cols = (n + 1) // 2
+        fig, axes = plt.subplots(2, n_cols, figsize=(n_cols * 4, 8))
+        for i in range(n):
+            ax = axes[i // n_cols, i % n_cols]
+            ax.imshow(x[idx[i]], cmap='viridis')
             ax.set_title(f"Class {cls}")
+        for i in range(n, 2 * n_cols):
+            axes[i // n_cols, i % n_cols].axis('off')
         plt.savefig(f"evaluation/explore/examples_class_{cls}.png")
 
-# show_example_images_from_each_class()
-
+show_example_images_from_each_class(selected_classes=[0, 23, 38, 53])
+ 
 def show_pixel_distribution():
     """
     1. Transform 
@@ -120,10 +125,18 @@ def show_pixel_distribution():
     plt.hist(X_train.flatten(), bins=100)
     plt.savefig('evaluation/explore/pixel_distribution.png')
 
-show_pixel_distribution()
+# show_pixel_distribution()
 
 def show_stats():
     X_train = np.load('output/preprocessing/resized_expressions.npy').astype(np.float32)
+    # Shape
+    print(f"Shape: {X_train.shape}")
+    # Range
+    print(f"Range: [{X_train.min():.4f}, {X_train.max():.4f}]")
+    # Mean
+    print(f"Mean: {X_train.mean():.4f}")
+    # Std
+    print(f"Std: {X_train.std():.4f}")
     # Number of 0 valued pixels
     num_pixels = (X_train == 0).sum()
     print(f"Number of 0 valued pixels: {num_pixels}")
@@ -135,3 +148,4 @@ def show_stats():
     print(f"Number of pixels above 0.5: {num_pixels}")
 
 # show_stats()
+# get_class_stats()

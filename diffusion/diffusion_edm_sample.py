@@ -149,6 +149,11 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
     evaluation/evaluation.py evaluate_diffusion_map() can consume the output without
     any changes.
 
+    Each class is written to a per-class temp file immediately after generation so
+    that a crash or timeout only loses the class currently in progress. If temp files
+    from a previous run exist, those classes are skipped (resume support). Temp files
+    are deleted once the final merged output is saved successfully.
+
     Args:
         model: Trained U-Net loaded via load_model().
         config: Config dict (get_config('diagnostic') etc.).
@@ -161,6 +166,8 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
         X_synthetic: [N, H, W] float32 numpy array.
         y_synthetic: [N, num_classes] float32 one-hot numpy array.
     """
+    import shutil
+
     num_classes = config['num_classes']
     image_size  = config['image_size']
     sigma_data  = config.get('sigma_data', 0.139)
@@ -170,17 +177,31 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
 
     sigmas = diffusion_utils.edm_sigma_schedule(sigma_max, sigma_min, num_steps, rho)
 
+    out_dir = output_dir or config['sample_dir']
+    os.makedirs(out_dir, exist_ok=True)
+    tmp_dir = os.path.join(out_dir, f'_tmp_w{guidance_scale:.1f}')
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    def _tmp_path(class_id):
+        return os.path.join(tmp_dir, f'class_{class_id:03d}.npy')
+
+    already_done = [c for c in range(num_classes) if os.path.exists(_tmp_path(c))]
+    if already_done:
+        print(f"\nResuming: {len(already_done)}/{num_classes} classes already saved in {tmp_dir}")
+
     print(f"\nGenerating synthetic dataset (EDM Heun sampler):")
     print(f"  Classes:           {num_classes}")
     print(f"  Samples per class: {samples_per_class}")
     print(f"  Total samples:     {num_classes * samples_per_class}")
     print(f"  Guidance scale:    {guidance_scale}")
     print(f"  ODE steps:         {num_steps}  (2×{num_steps - 1} + 1 model evals)")
-
-    all_images = []
-    all_labels = []
+    print(f"  Per-class temp dir: {tmp_dir}")
 
     for class_id in tqdm(range(num_classes), desc='Classes'):
+        tmp_path = _tmp_path(class_id)
+        if os.path.exists(tmp_path):
+            continue  # already generated in a previous run
+
         class_labels = np.full(samples_per_class, class_id, dtype=np.int32)
         samples = sample_edm_batch(
             model,
@@ -195,8 +216,20 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
         labels = np.zeros((samples_per_class, num_classes), dtype=np.float32)
         labels[:, class_id] = 1.0
 
-        all_images.append(samples[..., 0])  # [N, H, W] — drop channel dim to match DDPM format
-        all_labels.append(labels)
+        # Pack labels + flattened images into a single array so the class is atomic
+        imgs_flat = samples[..., 0].reshape(samples_per_class, -1)   # [N, H*W]
+        payload   = np.concatenate([labels, imgs_flat], axis=1).astype(np.float32)
+        np.save(tmp_path, payload)
+
+    # Merge all per-class files into the final output arrays
+    print("\nMerging per-class files...")
+    all_images, all_labels = [], []
+    for class_id in range(num_classes):
+        payload   = np.load(_tmp_path(class_id))
+        lbl       = payload[:, :num_classes]
+        imgs_flat = payload[:, num_classes:]
+        all_labels.append(lbl)
+        all_images.append(imgs_flat.reshape(samples_per_class, image_size, image_size))
 
     X_synthetic = np.concatenate(all_images, axis=0)
     y_synthetic = np.concatenate(all_labels, axis=0)
@@ -206,17 +239,18 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
     X_synthetic = X_synthetic[indices]
     y_synthetic = y_synthetic[indices]
 
-    out_dir = output_dir or config['sample_dir']
-    os.makedirs(out_dir, exist_ok=True)
     feat_path = os.path.join(out_dir, f'diffusion_synthetic_expressions_w{guidance_scale:.1f}.npy')
     lbl_path  = os.path.join(out_dir, f'diffusion_synthetic_labels_w{guidance_scale:.1f}.npy')
     np.save(feat_path, X_synthetic)
-    np.save(lbl_path, y_synthetic)
+    np.save(lbl_path,  y_synthetic)
 
     print(f"\nSaved synthetic dataset:")
     print(f"  Features: {feat_path}  {X_synthetic.shape}")
     print(f"  Labels:   {lbl_path}  {y_synthetic.shape}")
     print(f"  Value range: [{X_synthetic.min():.4f}, {X_synthetic.max():.4f}]")
+
+    shutil.rmtree(tmp_dir)
+    print(f"  Temp files cleaned up.")
 
     return X_synthetic, y_synthetic
 
