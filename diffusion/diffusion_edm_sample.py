@@ -123,9 +123,15 @@ def load_model(config, checkpoint_path):
     Unlike the DDPM load_model, this does NOT call init_schedule — EDM sampling
     uses sigma schedules directly, not the cosine/linear alpha-cumprod tables.
     """
+    import keras
     from diffusion.diffusion_model import build_unet
 
     print(f"\nLoading model from: {checkpoint_path}")
+
+    if config.get('mixed_precision', False):
+        policy = keras.mixed_precision.Policy('mixed_float16')
+        keras.mixed_precision.set_global_policy(policy)
+        print("  Mixed precision: float16 compute / float32 variables")
 
     norm_path = os.path.join(config['checkpoint_dir'], 'norm_constants.json')
     if os.path.exists(norm_path):
@@ -142,7 +148,7 @@ def load_model(config, checkpoint_path):
 
 
 def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.0,
-                          num_steps=40, output_dir=None):
+                          num_steps=40, output_dir=None, classes_per_batch=1):
     """Generate a synthetic dataset for all classes using the EDM ODE sampler.
 
     Produces the same .npy file format as diffusion_sample.generate_dataset so that
@@ -161,6 +167,10 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
         guidance_scale: CFG scale w.
         num_steps: Number of ODE steps (40 is the EDM paper default).
         output_dir: Where to save the .npy files. Defaults to config['sample_dir'].
+        classes_per_batch: Number of classes to generate simultaneously. Each class
+            contributes samples_per_class samples; the CFG pass sees
+            2 * classes_per_batch * samples_per_class images per forward call.
+            Use 1 on M1 (shared memory), 4–8 on T4 (16 GB GDDR6).
 
     Returns:
         X_synthetic: [N, H, W] float32 numpy array.
@@ -189,20 +199,27 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
     if already_done:
         print(f"\nResuming: {len(already_done)}/{num_classes} classes already saved in {tmp_dir}")
 
+    cfg_batch = 2 * classes_per_batch * samples_per_class
     print(f"\nGenerating synthetic dataset (EDM Heun sampler):")
     print(f"  Classes:           {num_classes}")
     print(f"  Samples per class: {samples_per_class}")
     print(f"  Total samples:     {num_classes * samples_per_class}")
     print(f"  Guidance scale:    {guidance_scale}")
     print(f"  ODE steps:         {num_steps}  (2×{num_steps - 1} + 1 model evals)")
+    print(f"  Classes per batch: {classes_per_batch}  (CFG batch size: {cfg_batch})")
     print(f"  Per-class temp dir: {tmp_dir}")
 
-    for class_id in tqdm(range(num_classes), desc='Classes'):
-        tmp_path = _tmp_path(class_id)
-        if os.path.exists(tmp_path):
-            continue  # already generated in a previous run
+    chunks = [list(range(num_classes))[i:i + classes_per_batch]
+              for i in range(0, num_classes, classes_per_batch)]
 
-        class_labels = np.full(samples_per_class, class_id, dtype=np.int32)
+    for chunk in tqdm(chunks, desc='Batches'):
+        pending = [c for c in chunk if not os.path.exists(_tmp_path(c))]
+        if not pending:
+            continue
+
+        class_labels = np.concatenate([
+            np.full(samples_per_class, c, dtype=np.int32) for c in pending
+        ])
         samples = sample_edm_batch(
             model,
             class_labels=class_labels,
@@ -211,15 +228,16 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
             sigma_data=sigma_data,
             guidance_scale=guidance_scale,
             image_size=image_size,
-        )  # [N, H, W, 1]
+        )  # [len(pending)*samples_per_class, H, W, 1]
 
-        labels = np.zeros((samples_per_class, num_classes), dtype=np.float32)
-        labels[:, class_id] = 1.0
-
-        # Pack labels + flattened images into a single array so the class is atomic
-        imgs_flat = samples[..., 0].reshape(samples_per_class, -1)   # [N, H*W]
-        payload   = np.concatenate([labels, imgs_flat], axis=1).astype(np.float32)
-        np.save(tmp_path, payload)
+        for i, class_id in enumerate(pending):
+            class_samples = samples[i * samples_per_class:(i + 1) * samples_per_class]
+            labels = np.zeros((samples_per_class, num_classes), dtype=np.float32)
+            labels[:, class_id] = 1.0
+            # Pack labels + flattened images into a single array so the class is atomic
+            imgs_flat = class_samples[..., 0].reshape(samples_per_class, -1)  # [N, H*W]
+            payload   = np.concatenate([labels, imgs_flat], axis=1).astype(np.float32)
+            np.save(_tmp_path(class_id), payload)
 
     # Merge all per-class files into the final output arrays
     print("\nMerging per-class files...")
@@ -287,6 +305,9 @@ Examples:
                         help='Number of EDM ODE steps (default: 40)')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory for .npy files (default: config sample_dir)')
+    parser.add_argument('--classes-per-batch', type=int, default=1,
+                        help='Classes to generate simultaneously (default: 1). '
+                             'Use 4–8 on T4 (16 GB), 1–2 on M1 (shared memory).')
 
     args = parser.parse_args()
     config = get_config(args.mode)
@@ -299,6 +320,7 @@ Examples:
             guidance_scale=args.guidance_scale,
             num_steps=args.num_steps,
             output_dir=args.output_dir,
+            classes_per_batch=args.classes_per_batch,
         )
     else:
         print("\nNo action specified. Use --generate-dataset.")

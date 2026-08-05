@@ -147,5 +147,5 @@ def show_stats():
     num_pixels = (X_train > 0.5).sum()
     print(f"Number of pixels above 0.5: {num_pixels}")
 
-# show_stats()
+show_stats()
 # get_class_stats()

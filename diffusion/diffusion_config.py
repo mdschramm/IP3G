@@ -183,7 +183,7 @@ def get_config(mode='local'):
     """Return configuration dict for the specified training mode.
 
     Args:
-        mode: 'local' (Mac M2), 'remote' (A100), or 'diagnostic' (30k-step remote arch)
+        mode: 'local' (Mac M2), 'remote' (16GB GPU), or 'diagnostic' (30k-step remote arch same as remote)
     """
     if mode == 'local':
         return CONFIG_LOCAL.copy()
