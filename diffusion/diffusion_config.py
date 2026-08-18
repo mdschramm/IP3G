@@ -11,7 +11,7 @@ weight w(σ)·c_out²=1 at all noise levels.
 CONFIG_LOCAL = {
     # Model architecture
     'image_size': 128,
-    'in_channels': 1,
+    'in_channels': 16,
     'channels': [32, 64, 128],           # 3 levels (kept small for M2)
     'num_res_blocks': 2,                  # Per resolution
     'attention_resolutions': [],          # No mid-run attention on M2 (bottleneck only)
@@ -39,8 +39,8 @@ CONFIG_LOCAL = {
     'mixed_precision': True,
 
     # EDM2 noise parameterization
-    'sigma_data': 0.139,                  # std of normalized training data (measured: np.std(resized_expressions.npy))
-    'P_mean': -2.0,                       # log-normal σ center: exp(-2.0)≈0.135≈sigma_data
+    'sigma_data': 0.1709, # (from occupied pixel variance shown in sigma_data.json)                  # std of OCCUPIED positions only (measured: output/preprocessing/sigma_data.json → "occupied"); update after re-running preprocessing
+    'P_mean': -1.77,                       # ln(sigma_data_occupied); update to match after re-running preprocessing
     'P_std': 1.2,                         # log-normal σ spread (paper default)
     'sigma_min': 0.002,                   # near-clean inference endpoint
     'sigma_max': 80.0,                    # pure-noise inference starting point
@@ -67,7 +67,7 @@ CONFIG_LOCAL = {
 CONFIG_REMOTE = {
     # Model architecture
     'image_size': 128,
-    'in_channels': 1,
+    'in_channels': 16,
     'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
     'num_res_blocks': 3,
     'attention_resolutions': [16],        # Attention at 16×16 bottleneck resolution
@@ -95,8 +95,8 @@ CONFIG_REMOTE = {
     'mixed_precision': True,
 
     # EDM2 noise parameterization
-    'sigma_data': 0.139,
-    'P_mean': -2.0,
+    'sigma_data': 0.1709, # (from occupied pixel variance shown in sigma_data.json)
+    'P_mean': -1.77,
     'P_std': 1.2,
     'sigma_min': 0.002,
     'sigma_max': 80.0,
@@ -126,7 +126,7 @@ CONFIG_REMOTE = {
 CONFIG_DIAGNOSTIC = {
     # Architecture — identical to remote so results are representative
     'image_size': 128,
-    'in_channels': 1,
+    'in_channels': 16,
     'channels': [32, 64, 128, 256],
     'num_res_blocks': 3,
     'attention_resolutions': [16],
@@ -154,8 +154,8 @@ CONFIG_DIAGNOSTIC = {
     'mixed_precision': True,
 
     # EDM2 noise parameterization
-    'sigma_data': 0.139,
-    'P_mean': -2.0,
+    'sigma_data': 0.1709, # (from occupied pixel variance shown in sigma_data.json)
+    'P_mean': -1.77,
     'P_std': 1.2,
     'sigma_min': 0.002,
     'sigma_max': 80.0,

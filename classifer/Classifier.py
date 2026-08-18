@@ -58,7 +58,7 @@ def f1_m(y_true, y_pred):
 def get_model(num_classes):
     model = Sequential()
 
-    model.add(Conv2D(32 , kernel_size=15 , strides=2 , padding="same" , input_shape=(128,128,1)))
+    model.add(Conv2D(32 , kernel_size=15 , strides=2 , padding="same" , input_shape=(128,128,16)))
     model.add(LeakyReLU(alpha=0.2))
 
             

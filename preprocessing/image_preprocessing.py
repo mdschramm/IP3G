@@ -216,13 +216,13 @@ def create_expression_images_from_tsne(sample_gene_expressions, normalized_tsne,
 def pad_data(data, pad_size):
     """
     Center-pad images to target size with zeros.
-    
+
     Args:
-        data: Image array, shape (N_samples, w, h)
+        data: Image array, shape (N_samples, w, h) or (N_samples, w, h, C)
         pad_size: Target size for width and height
-        
+
     Returns:
-        np.ndarray: Padded images, shape (N_samples, pad_size, pad_size)
+        np.ndarray: Padded images, shape (N_samples, pad_size, pad_size) or (N_samples, pad_size, pad_size, C)
         If input is larger than pad_size, returns original data with warning.
     """
     if data.shape[1] > pad_size or data.shape[2] > pad_size:
@@ -232,8 +232,147 @@ def pad_data(data, pad_size):
     right_padd = max(0, math.ceil((pad_size - data.shape[1])/2))
     top_padd = max(0, math.floor((pad_size - data.shape[2])/2))
     bottom_padd = max(0, math.ceil((pad_size - data.shape[2])/2))
-    data = np.pad(data , [(0,0),(left_padd,right_padd),(top_padd,bottom_padd)], 'constant')
+    if data.ndim == 4:
+        data = np.pad(data, [(0,0),(left_padd,right_padd),(top_padd,bottom_padd),(0,0)], 'constant')
+    else:
+        data = np.pad(data, [(0,0),(left_padd,right_padd),(top_padd,bottom_padd)], 'constant')
     return data
+
+
+def compute_gene_importance_order(sample_gene_expressions, phenotypes):
+    """
+    Rank genes by ANOVA F-statistic across tissue classes (descending).
+
+    Genes with higher F-statistics have stronger class-discriminative signal and
+    are assigned to lower channel indices in the multichannel image, where they
+    receive dedicated 1-to-1 pixel slots rather than being averaged into overflow.
+
+    Args:
+        sample_gene_expressions: (N_samples, N_genes) float32
+        phenotypes: (N_samples,) string labels (body site)
+
+    Returns:
+        gene_importance_order: (N_genes,) int64, indices of genes sorted by F-stat descending
+        f_stats: (N_genes,) float32, F-statistic per gene
+    """
+    X = sample_gene_expressions.astype(np.float64)
+    N, G = X.shape
+    labels_unique = sorted(set(phenotypes))
+    K = len(labels_unique)
+    label_to_idx = {l: i for i, l in enumerate(labels_unique)}
+    labels = np.array([label_to_idx[p] for p in phenotypes])
+
+    grand_mean = X.mean(axis=0)                          # (G,)
+    class_means = np.zeros((K, G), dtype=np.float64)
+    class_counts = np.zeros(K, dtype=np.float64)
+
+    for k in range(K):
+        mask = labels == k
+        class_means[k] = X[mask].mean(axis=0)
+        class_counts[k] = mask.sum()
+
+    ss_between = np.sum(class_counts[:, None] * (class_means - grand_mean) ** 2, axis=0)
+    ss_within = sum(
+        np.sum((X[labels == k] - class_means[k]) ** 2, axis=0) for k in range(K)
+    )
+    f_stats = (ss_between / (K - 1)) / (ss_within / (N - K) + 1e-10)
+    f_stats = f_stats.astype(np.float32)
+
+    gene_importance_order = np.argsort(f_stats)[::-1].astype(np.int64)
+    print(f"  Gene importance order computed. Top F-stat: {f_stats[gene_importance_order[0]]:.1f}  "
+          f"Median: {np.median(f_stats):.1f}")
+    return gene_importance_order, f_stats
+
+
+def create_multichannel_expression_images_from_tsne(
+    sample_gene_expressions, normalized_tsne, gene_importance_order, w, h, n_channels=16
+):
+    """
+    Convert gene expression vectors to 16-channel 2D images using t-SNE coordinates.
+
+    Genes are assigned to channels in descending F-statistic order: the most
+    discriminative gene at each pixel goes into channel 0, the next into channel 1,
+    etc.  Channels 0-14 each hold exactly one gene per pixel; channel 15 holds the
+    mean of all overflow genes (those beyond the 14th at a given pixel).
+
+    Forward normalization (3 steps):
+      1. Channel assignment: fill_count tracks next available channel per pixel.
+         Genes 0-14 at a pixel get a dedicated slot; gene 15+ accumulates in ch15.
+      2. Averaging: channel-15 pixels with >1 overflow gene are divided by overflow count.
+      3. Per-channel normalization: each channel divided by its own max value so that
+         all channels are independently in [0, 1]. channel_scales[k] stores the pre-
+         division max and is used by the reverse mapping to recover RSEM units.
+
+    Args:
+        sample_gene_expressions: (N_samples, N_genes) float32 RSEM counts
+        normalized_tsne: (N_genes, 2) float array (already scaled to 0..TARGET_SIZE-1)
+        gene_importance_order: (N_genes,) int64, genes sorted by F-stat descending
+        w: image width  (max x-coordinate, inclusive)
+        h: image height (max y-coordinate, inclusive)
+        n_channels: number of channels (default 16)
+
+    Returns:
+        data: (N_samples, w+1, h+1, n_channels) float32 in [0, 1]
+        pixel_occupancy_mask: (w+1, h+1, n_channels) bool, True where a gene is assigned
+        gene_pixel_channel: (N_genes, 3) int32  [px, py, ch] per gene, original ordering
+        channel_scales: (n_channels,) float32 pre-division channel maxima
+    """
+    N_samples, N_genes = sample_gene_expressions.shape
+    data = np.zeros((N_samples, w + 1, h + 1, n_channels), dtype=np.float32)
+
+    # Build pixel→channel assignment from gene importance order (same for all samples)
+    fill_count = np.zeros((w + 1, h + 1), dtype=np.int32)
+    overflow_count = np.zeros((w + 1, h + 1), dtype=np.int32)
+
+    # gene_pixel_channel[g] = [px, py, ch] in the ORIGINAL gene ordering
+    gene_pixel_channel = np.zeros((N_genes, 3), dtype=np.int32)
+    # Track mapping from importance-sorted index → original gene index
+    for rank, gene_idx in enumerate(gene_importance_order):
+        px = int(normalized_tsne[gene_idx][0])
+        py = int(normalized_tsne[gene_idx][1])
+        c = fill_count[px, py]
+        if c < n_channels - 1:
+            gene_pixel_channel[gene_idx] = [px, py, c]
+            fill_count[px, py] += 1
+        else:
+            gene_pixel_channel[gene_idx] = [px, py, n_channels - 1]
+            overflow_count[px, py] += 1
+
+    # occupancy mask: True wherever at least one gene is assigned
+    pixel_occupancy_mask = np.zeros((w + 1, h + 1, n_channels), dtype=bool)
+    for gene_idx in range(N_genes):
+        px, py, ch = gene_pixel_channel[gene_idx]
+        pixel_occupancy_mask[px, py, ch] = True
+
+    print(f"  Pixel-channel assignment done. "
+          f"Overflow pixels (ch15): {np.sum(overflow_count > 0):,}  "
+          f"Total occupied positions: {np.sum(pixel_occupancy_mask):,}")
+
+    # Fill data for each sample
+    for i, profile in enumerate(sample_gene_expressions):
+        if i % 1000 == 0:
+            print(f"  Creating multichannel images: sample {i}/{N_samples}")
+        for gene_idx in range(N_genes):
+            px, py, ch = gene_pixel_channel[gene_idx]
+            data[i, px, py, ch] += profile[gene_idx]
+
+        # Average channel-15 pixels that received >1 overflow gene
+        ov_mask = overflow_count > 1
+        data[i, :, :, n_channels - 1][ov_mask] /= overflow_count[ov_mask]
+
+    # Per-channel normalization — each channel independently to [0, 1]
+    channel_scales = np.zeros(n_channels, dtype=np.float32)
+    for k in range(n_channels):
+        ch_max = float(np.max(data[:, :, :, k]))
+        if ch_max > 0:
+            channel_scales[k] = ch_max
+            data[:, :, :, k] /= ch_max
+        else:
+            channel_scales[k] = 1.0
+
+    print(f"  Multichannel images created. Shape: {data.shape}  "
+          f"Value range: [{data.min():.4f}, {data.max():.4f}]")
+    return data, pixel_occupancy_mask, gene_pixel_channel, channel_scales
 
 # unused
 # def resize_images(images, target_size=TARGET_SIZE):

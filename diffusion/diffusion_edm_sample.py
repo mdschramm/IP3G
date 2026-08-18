@@ -13,6 +13,7 @@ Usage:
     from diffusion.diffusion_utils import edm_sigma_schedule
 
     sigmas  = edm_sigma_schedule(sigma_max=80.0, sigma_min=0.002, num_steps=40)
+    mask    = tf.constant(np.load("output/preprocessing/pixel_occupancy_mask.npy").astype("float32"))
     samples = sample_edm_batch(
         model,
         class_labels=np.array([0, 1, 5, 12]),
@@ -21,7 +22,8 @@ Usage:
         sigma_data=0.139,
         guidance_scale=3.0,
         image_size=128,
-    )  # → numpy [N, H, W, 1] in [0, 1]
+        occupancy_mask=mask,
+    )  # → numpy [N, H, W, 16] in [0, 1]
 """
 
 import os
@@ -33,8 +35,12 @@ from tqdm import tqdm
 import diffusion.diffusion_utils as diffusion_utils
 
 
-def _denoise(model, x, sigma, cond_labels, uncond_labels, guidance_scale, sigma_data, n):
+def _denoise(model, x, sigma, cond_labels, uncond_labels, guidance_scale, sigma_data, n,
+             mask_batch):
     """Run a single CFG denoiser call at noise level sigma.
+
+    mask_batch: (n, H, W, C) float32 occupancy mask — broadcast to 2n for the
+                concatenated CFG forward pass.
 
     Returns:
         D: denoised image estimate  D(x, σ, c) = c_skip*x + c_out*F_cfg
@@ -51,10 +57,11 @@ def _denoise(model, x, sigma, cond_labels, uncond_labels, guidance_scale, sigma_
     t_in = tf.fill([n], tf.constant(c_noise, dtype=tf.float32))
 
     # CFG: single concatenated forward pass to halve kernel launches
-    x_cat = tf.concat([x_in, x_in], axis=0)
-    t_cat = tf.concat([t_in, t_in], axis=0)
-    l_cat = tf.concat([uncond_labels, cond_labels], axis=0)
-    F_both, _ = model([x_cat, t_cat, l_cat], training=False)
+    x_cat    = tf.concat([x_in, x_in], axis=0)
+    t_cat    = tf.concat([t_in, t_in], axis=0)
+    l_cat    = tf.concat([uncond_labels, cond_labels], axis=0)
+    mask_cat = tf.concat([mask_batch, mask_batch], axis=0)
+    F_both, _ = model([x_cat, t_cat, l_cat, mask_cat], training=False)
     F_both = tf.cast(F_both, tf.float32)
     # uncond is first half, cond is second half (matches order in dataset CFG dropout)
     F_cfg = F_both[:n] + guidance_scale * (F_both[n:] - F_both[:n])
@@ -65,28 +72,40 @@ def _denoise(model, x, sigma, cond_labels, uncond_labels, guidance_scale, sigma_
 
 
 def sample_edm_batch(model, class_labels, num_classes, sigmas, sigma_data=0.139,
-                     guidance_scale=3.0, image_size=128):
+                     guidance_scale=3.0, image_size=128, occupancy_mask=None):
     """Generate a batch of images via the EDM 2nd-order Heun ODE sampler.
 
-    Starts from pure Gaussian noise x ~ N(0, sigma_max²·I) and denoises through
-    the σ schedule to σ=0 (clean image). No seed image required.
+    Starts from pure Gaussian noise x ~ N(0, sigma_max²·I) masked to occupied
+    channels only, then denoises through the σ schedule to σ=0. The occupancy
+    mask is applied after every ODE step to keep structural zeros exactly zero.
 
     Args:
         model: Trained U-Net from build_unet (expects float32 timestep input).
         class_labels: numpy int32 array of length N, target class indices.
         num_classes: total number of classes (unconditional token = num_classes).
         sigmas: descending σ array from edm_sigma_schedule(), last element must be 0.
-        sigma_data: std of training data (must match training config).
+        sigma_data: std of occupied training positions (must match training config).
         guidance_scale: CFG scale. 1.0 = no guidance, 3.0–7.0 = typical range.
         image_size: spatial resolution H=W.
+        occupancy_mask: (H, W, C) float32 tensor or None. If None a dense all-ones
+                        mask is used (backward compatible with single-channel models).
 
     Returns:
-        numpy array, shape [N, H, W, 1], values in [0, 1] (or original data range
-        if diffusion_utils norm constants are loaded).
+        numpy array, shape [N, H, W, C], values in [0, 1].
     """
-    n = len(class_labels)
-    x = tf.random.normal([n, image_size, image_size, 1],
-                         dtype=tf.float32) * float(sigmas[0])
+    n          = len(class_labels)
+    in_channels = model.input_shape[0][-1]  # derive C from model input spec
+
+    if occupancy_mask is not None:
+        mask = tf.cast(occupancy_mask, tf.float32)           # (H, W, C)
+    else:
+        mask = tf.ones([image_size, image_size, in_channels], dtype=tf.float32)
+
+    mask_batch = tf.tile(mask[None], [n, 1, 1, 1])          # (n, H, W, C)
+
+    # Start from noise in occupied channels only; structural zeros stay 0
+    x = tf.random.normal([n, image_size, image_size, in_channels],
+                         dtype=tf.float32) * float(sigmas[0]) * mask_batch
 
     cond_labels   = tf.constant(class_labels, dtype=tf.int32)
     uncond_labels = tf.fill([n], tf.constant(num_classes, dtype=tf.int32))
@@ -97,21 +116,25 @@ def sample_edm_batch(model, class_labels, num_classes, sigmas, sigma_data=0.139,
 
         # 1st eval: ODE direction at (x, σ_i)
         _, d_i = _denoise(model, x, sigma, cond_labels, uncond_labels,
-                          guidance_scale, sigma_data, n)
+                          guidance_scale, sigma_data, n, mask_batch)
 
         # Euler predictor
         x_euler = x + (sigma_next - sigma) * d_i
+        x_euler = x_euler * mask_batch   # enforce structural zeros after Euler step
 
         if sigma_next > 0.0:
             # 2nd eval: Heun corrector at (x̂, σ_{i+1})
             _, d_next = _denoise(model, x_euler, sigma_next, cond_labels, uncond_labels,
-                                 guidance_scale, sigma_data, n)
+                                 guidance_scale, sigma_data, n, mask_batch)
             x = x + (sigma_next - sigma) * (d_i + d_next) / 2.0
         else:
             # Final step σ → 0: Euler only (corrector would divide by zero)
             x = x_euler
 
+        x = x * mask_batch   # re-enforce after each step
+
     x = tf.clip_by_value(x, 0.0, 1.0)
+    x = x * mask_batch   # final re-enforcement after clip
     if diffusion_utils.DATA_MIN is not None:
         x = diffusion_utils.denormalize(x)
     return x.numpy()
@@ -151,9 +174,7 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
                           num_steps=40, output_dir=None, classes_per_batch=1):
     """Generate a synthetic dataset for all classes using the EDM ODE sampler.
 
-    Produces the same .npy file format as diffusion_sample.generate_dataset so that
-    evaluation/evaluation.py evaluate_diffusion_map() can consume the output without
-    any changes.
+    Produces .npy files compatible with evaluation/evaluation.py evaluate_diffusion_map().
 
     Each class is written to a per-class temp file immediately after generation so
     that a crash or timeout only loses the class currently in progress. If temp files
@@ -173,19 +194,29 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
             Use 1 on M1 (shared memory), 4–8 on T4 (16 GB GDDR6).
 
     Returns:
-        X_synthetic: [N, H, W] float32 numpy array.
+        X_synthetic: [N, H, W, C] float32 numpy array.
         y_synthetic: [N, num_classes] float32 one-hot numpy array.
     """
     import shutil
 
     num_classes = config['num_classes']
     image_size  = config['image_size']
+    in_channels = config['in_channels']
     sigma_data  = config.get('sigma_data', 0.139)
     sigma_max   = config.get('sigma_max', 80.0)
     sigma_min   = config.get('sigma_min', 0.002)
     rho         = config.get('sigma_rho', 7)
 
     sigmas = diffusion_utils.edm_sigma_schedule(sigma_max, sigma_min, num_steps, rho)
+
+    # Load occupancy mask
+    mask_path = os.path.join(config['data_dir'], 'pixel_occupancy_mask.npy')
+    occupancy_mask = None
+    if os.path.exists(mask_path):
+        occupancy_mask = tf.constant(np.load(mask_path).astype(np.float32))
+        print(f"  Occupancy mask loaded: {occupancy_mask.shape}")
+    else:
+        print("  Warning: pixel_occupancy_mask.npy not found; using dense mask.")
 
     out_dir = output_dir or config['sample_dir']
     os.makedirs(out_dir, exist_ok=True)
@@ -228,14 +259,15 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
             sigma_data=sigma_data,
             guidance_scale=guidance_scale,
             image_size=image_size,
-        )  # [len(pending)*samples_per_class, H, W, 1]
+            occupancy_mask=occupancy_mask,
+        )  # [len(pending)*samples_per_class, H, W, C]
 
         for i, class_id in enumerate(pending):
             class_samples = samples[i * samples_per_class:(i + 1) * samples_per_class]
             labels = np.zeros((samples_per_class, num_classes), dtype=np.float32)
             labels[:, class_id] = 1.0
-            # Pack labels + flattened images into a single array so the class is atomic
-            imgs_flat = class_samples[..., 0].reshape(samples_per_class, -1)  # [N, H*W]
+            # Flatten all channels: [N, H*W*C]
+            imgs_flat = class_samples.reshape(samples_per_class, -1)
             payload   = np.concatenate([labels, imgs_flat], axis=1).astype(np.float32)
             np.save(_tmp_path(class_id), payload)
 
@@ -247,7 +279,7 @@ def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.
         lbl       = payload[:, :num_classes]
         imgs_flat = payload[:, num_classes:]
         all_labels.append(lbl)
-        all_images.append(imgs_flat.reshape(samples_per_class, image_size, image_size))
+        all_images.append(imgs_flat.reshape(samples_per_class, image_size, image_size, in_channels))
 
     X_synthetic = np.concatenate(all_images, axis=0)
     y_synthetic = np.concatenate(all_labels, axis=0)

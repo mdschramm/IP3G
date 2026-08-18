@@ -627,16 +627,21 @@ def build_unet(config):
     res_balance = config.get('res_balance', 0.3)
 
     # Inputs — t_input is float32: receives c_noise = ln(σ)/4 (continuous EDM2 conditioning)
-    x_input = layers.Input(shape=(image_size, image_size, in_channels), name='x_noisy')
-    t_input = layers.Input(shape=(), dtype=tf.float32, name='timesteps')
-    c_input = layers.Input(shape=(), dtype=tf.int32, name='class_labels')
-    
+    x_input    = layers.Input(shape=(image_size, image_size, in_channels), name='x_noisy')
+    t_input    = layers.Input(shape=(), dtype=tf.float32, name='timesteps')
+    c_input    = layers.Input(shape=(), dtype=tf.int32, name='class_labels')
+    mask_input = layers.Input(shape=(image_size, image_size, in_channels),
+                              dtype=tf.float32, name='occupancy_mask')
+
     # Embeddings
     embedding_layer = TimeAndClassEmbedding(num_classes, embedding_dim)
     conditioning = embedding_layer([t_input, c_input])
-    
-    # Initial convolution
+
+    # Initial convolution + soft mask conditioning
     h = MPConv2D(channels[0], 3)(x_input)
+    # Project binary mask into feature space (use_bias=False so unoccupied positions
+    # contribute exactly zero, not a learned offset).
+    h = h + MPConv2D(channels[0], 1, use_bias=False)(tf.cast(mask_input, h.dtype))
     
     # Encoder
     skip_connections = []
@@ -709,10 +714,14 @@ def build_unet(config):
     h = MPSiLU()(h)
     # MPConv2D output dtype matches h, which is float32 from the preceding GroupNorm.
     output = MPConv2D(in_channels, 3)(h)
-    
-    # Build model — outputs [pred_noise, logvar]; logvar is [B,1,1,1], pred_noise is [B,H,W,C]
+    # Hard occupancy enforcement: zero out positions that are structurally empty.
+    # Paired with the masked loss in train_step, this guarantees the model never
+    # predicts anything at unoccupied channels and is never penalized there.
+    output = output * tf.cast(mask_input, output.dtype)
+
+    # Build model — outputs [pred_F, logvar]; logvar is [B,1,1,1], pred_F is [B,H,W,C]
     model = keras.Model(
-        inputs=[x_input, t_input, c_input],
+        inputs=[x_input, t_input, c_input, mask_input],
         outputs=[output, logvar],
         name='conditional_unet'
     )
@@ -741,16 +750,19 @@ if __name__ == "__main__":
     print("="*60)
     
     batch_size = 4
-    x_test = tf.random.normal([batch_size, 128, 128, 1])
-    t_test = tf.random.uniform([batch_size], -1.55, 1.10, dtype=tf.float32)  # c_noise = ln(sigma)/4
-    c_test = tf.random.uniform([batch_size], 0, 54, dtype=tf.int32)
-    
+    in_ch = config['in_channels']
+    x_test    = tf.random.normal([batch_size, 128, 128, in_ch])
+    t_test    = tf.random.uniform([batch_size], -1.55, 1.10, dtype=tf.float32)  # c_noise = ln(sigma)/4
+    c_test    = tf.random.uniform([batch_size], 0, 54, dtype=tf.int32)
+    mask_test = tf.ones([batch_size, 128, 128, in_ch], dtype=tf.float32)
+
     print(f"Input shapes:")
-    print(f"  x_noisy: {x_test.shape}")
-    print(f"  timesteps: {t_test.shape}")
-    print(f"  class_labels: {c_test.shape}")
-    
-    pred_F, logvar = model([x_test, t_test, c_test], training=False)
+    print(f"  x_noisy:        {x_test.shape}")
+    print(f"  timesteps:      {t_test.shape}")
+    print(f"  class_labels:   {c_test.shape}")
+    print(f"  occupancy_mask: {mask_test.shape}")
+
+    pred_F, logvar = model([x_test, t_test, c_test, mask_test], training=False)
     print(f"\nOutput shape: {pred_F.shape}  logvar shape: {logvar.shape}")
     print(f"Output range: [{tf.reduce_min(pred_F):.4f}, {tf.reduce_max(pred_F):.4f}]")
     

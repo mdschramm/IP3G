@@ -152,24 +152,34 @@ def get_learning_rate_schedule(base_lr, warmup_steps, total_steps, schedule_kind
 
 
 @tf.function
-def train_step(model, x_noisy, timesteps, class_labels, target_F, optimizer):
-    """EDM2 training step with preconditioning-cancelled unit-weight loss.
+def train_step(model, x_noisy, timesteps, class_labels, target_F, optimizer, occupancy_mask):
+    """EDM2 training step with preconditioning-cancelled unit-weight masked loss.
 
     Preconditioning (c_skip, c_out, c_in) is applied in the dataset so that
-    w(σ)·c_out²(σ)=1 exactly — the loss is plain MSE+logvar with no per-sample
-    weighting needed here. `target_F` is the preconditioned denoising target
+    w(σ)·c_out²(σ)=1 exactly. `target_F` is the preconditioned denoising target
     computed by prepare_batch_conditional_edm.
+
+    occupancy_mask: (batch, H, W, C) float32, 1 at occupied positions and 0 at
+    structural zeros. Applied to x_noisy before the model call (so the denoiser
+    never sees noise at unoccupied channels) and used to compute a masked loss
+    (so structural zeros don't contribute to the gradient).
     """
+    # Zero out noise at unoccupied channels so structural zeros are exactly 0 in input
+    x_noisy = x_noisy * occupancy_mask
     with tf.GradientTape() as tape:
-        pred_F, logvar = model([x_noisy, timesteps, class_labels], training=True)
+        pred_F, logvar = model([x_noisy, timesteps, class_labels, occupancy_mask], training=True)
         # Reshape (no variables) inherits float16 compute dtype in Keras 3; re-cast here.
-        logvar = tf.cast(logvar, tf.float32)
+        logvar   = tf.cast(logvar, tf.float32)
         # Safety clamp: MPLinear-bounded logvar should stay in [-11, 11] by construction,
         # but clamp defensively so a single bad batch cannot cause irreversible divergence.
-        logvar = tf.clip_by_value(logvar, -10.0, 5.0)
-        target = tf.cast(target_F, pred_F.dtype)
-        mse    = tf.cast(tf.square(pred_F - target), tf.float32)
-        loss   = tf.reduce_mean(mse / tf.exp(logvar) + logvar)
+        logvar   = tf.clip_by_value(logvar, -10.0, 5.0)
+        target   = tf.cast(target_F, pred_F.dtype)
+        mask_f32 = tf.cast(occupancy_mask, tf.float32)
+        mse      = tf.cast(tf.square(pred_F - target), tf.float32)
+        # Masked reduction: average only over occupied positions so structural zeros
+        # don't inflate the denominator and dilute the effective learning signal.
+        n_occ    = tf.maximum(tf.reduce_sum(mask_f32), 1.0)
+        loss     = tf.reduce_sum((mse / tf.exp(logvar) + logvar) * mask_f32) / n_occ
 
         # Scale loss INSIDE tape so gradients survive FP16's limited range.
         scaled_loss = optimizer.scale_loss(loss) if hasattr(optimizer, 'scale_loss') else loss
@@ -201,7 +211,8 @@ def _build_probe_model(model):
     return probe, names
 
 
-def _collect_diag_step(model, probe_model, probe_names, x_noisy, timesteps, class_labels):
+def _collect_diag_step(model, probe_model, probe_names, x_noisy, timesteps, class_labels,
+                        occupancy_mask):
     """Compute per-layer weight and activation magnitude stats for one batch.
 
     Returns:
@@ -227,7 +238,7 @@ def _collect_diag_step(model, probe_model, probe_names, x_noisy, timesteps, clas
     # Activation stats from probe model
     a_mean, a_std = {}, {}
     if probe_model is not None:
-        acts = probe_model([x_noisy, timesteps, class_labels], training=False)
+        acts = probe_model([x_noisy, timesteps, class_labels, occupancy_mask], training=False)
         if not isinstance(acts, (list, tuple)):
             acts = [acts]
         for name, act in zip(probe_names, acts):
@@ -315,7 +326,8 @@ def _gn_precision_risks(a_mean, a_std):
 _GRAD_NORM_MAX_SAMPLES = 4  # Small batch for the diagnostic backward pass
 
 
-def _collect_grad_norms(model, x_noisy, timesteps, class_labels, true_noise, loss_scale=1.0):
+def _collect_grad_norms(model, x_noisy, timesteps, class_labels, true_noise, occupancy_mask,
+                         loss_scale=1.0):
     """Compute per-layer-group gradient norms without applying weight updates.
 
     Uses only the first _GRAD_NORM_MAX_SAMPLES samples from the batch to bound
@@ -340,9 +352,10 @@ def _collect_grad_norms(model, x_noisy, timesteps, class_labels, true_noise, los
     t_s  = timesteps[:n]
     c_s  = class_labels[:n]
     y_s  = true_noise[:n]
+    m_s  = occupancy_mask[:n]
 
     with tf.GradientTape() as tape:
-        pred, _ = model([x_s, t_s, c_s], training=False)
+        pred, _ = model([x_s, t_s, c_s, m_s], training=False)
         # Cast both sides to float32: pred may be float16 under mixed precision, and a
         # float16 MSE loss readily underflows to 0 → tape.gradient(0, weights) = 0 everywhere,
         # making grad_uflow and grad_p50 meaningless. Float32 loss gives real gradient magnitudes.
@@ -410,6 +423,13 @@ def generate_samples(model, config, num_samples=16, guidance_scale=3.0):
         rho=config.get('sigma_rho', 7),
     )
     class_labels = (np.arange(num_samples) % config['num_classes']).astype(np.int32)
+
+    # Load occupancy mask for structurally-aware sampling
+    mask_path = os.path.join(config['data_dir'], 'pixel_occupancy_mask.npy')
+    occupancy_mask = None
+    if os.path.exists(mask_path):
+        occupancy_mask = tf.constant(np.load(mask_path).astype(np.float32))  # (128, 128, 16)
+
     samples = sample_edm_batch(
         model,
         class_labels=class_labels,
@@ -418,8 +438,9 @@ def generate_samples(model, config, num_samples=16, guidance_scale=3.0):
         sigma_data=config['sigma_data'],
         guidance_scale=guidance_scale,
         image_size=config['image_size'],
+        occupancy_mask=occupancy_mask,
     )
-    return samples[..., 0]  # [N, H, W]
+    return samples[..., 0]  # [N, H, W] — channel 0 for visualization
 
 
 def save_sample_grid(samples, step, output_dir, run_id='', seed_images=None):
@@ -535,6 +556,11 @@ def train(config, resume_from=None):
     if excluded:
         X_train, y_train = filter_classes(X_train, y_train, excluded)
         print(f"  Excluded classes {excluded}: {len(X_train)} samples remain")
+
+    # Load occupancy mask — constant across all batches
+    occ_mask_np = np.load(os.path.join(data_dir, 'pixel_occupancy_mask.npy')).astype(np.float32)
+    occ_mask = tf.constant(occ_mask_np[None])   # (1, 128, 128, 16) — tiled per batch below
+    print(f"  Occupancy mask: {occ_mask_np.shape}  occupied: {int(occ_mask_np.sum()):,} / {occ_mask_np.size:,} positions")
 
     # Set global normalization constants (and persist them for sampling)
     diffusion_utils.set_data_range(X_train.min(), X_train.max())
@@ -652,6 +678,9 @@ def train(config, resume_from=None):
 
     dataset_iter = iter(dataset.repeat())
 
+    # Pre-tile mask to full batch size (drop_remainder=True guarantees constant size)
+    mask_batch = tf.tile(occ_mask, [config['batch_size'], 1, 1, 1])
+
     while step < config['num_steps']:
         # Get batch
         inputs, true_noise = next(dataset_iter)
@@ -664,6 +693,7 @@ def train(config, resume_from=None):
             inputs['class_labels'],
             true_noise,
             optimizer,
+            mask_batch,
         )
         
         # Update EMA
@@ -674,6 +704,7 @@ def train(config, resume_from=None):
             w_mean, w_max, a_mean, a_std = _collect_diag_step(
                 model, probe_model, probe_names,
                 inputs['X_noisy'], inputs['timesteps'], inputs['class_labels'],
+                mask_batch,
             )
             diag_history['steps'].append(step)
             for k, v in w_mean.items():
@@ -709,7 +740,7 @@ def train(config, resume_from=None):
             gn_risks = _gn_precision_risks(a_mean, a_std)
             grad_norms, uflow_frac = _collect_grad_norms(
                 model, inputs['X_noisy'], inputs['timesteps'], inputs['class_labels'],
-                true_noise, loss_scale=loss_scale,
+                true_noise, mask_batch, loss_scale=loss_scale,
             )
             diag_history['loss_scale'].append(loss_scale)
             for k, v in gn_risks.items():
