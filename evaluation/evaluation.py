@@ -6,9 +6,11 @@ import csv
 import argparse
 from datetime import datetime
 
+from preprocessing.artifact_paths import DEFAULT_CONFIG
+
 RUN_MODE = os.environ.get("RUN_MODE", "local")
 
-PREPROCESSING_DIR = "output/preprocessing"
+PREPROCESSING_DIR = DEFAULT_CONFIG.artifact_dir
 # Download remotely trained classifer
 CLASSIFIER_DIR = f"output/classifier/remote"
 # Download remotely trained GAN

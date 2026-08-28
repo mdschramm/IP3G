@@ -37,8 +37,9 @@ import numpy as np
 import tensorflow as tf
 
 from classifer.Classifier import f1_m, precision_m, recall_m
+from preprocessing.artifact_paths import DEFAULT_CONFIG
 
-PREPROCESSING_DIR  = "output/preprocessing"
+PREPROCESSING_DIR  = DEFAULT_CONFIG.artifact_dir
 CLASSIFIER_DIR     = "output/classifier/remote"
 CLASSIFIER_WEIGHTS = "classifier_weights_only.keras"
 OUTPUT_DIR         = "evaluation/difficult_classes"

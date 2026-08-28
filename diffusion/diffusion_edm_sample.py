@@ -13,7 +13,7 @@ Usage:
     from diffusion.diffusion_utils import edm_sigma_schedule
 
     sigmas  = edm_sigma_schedule(sigma_max=80.0, sigma_min=0.002, num_steps=40)
-    mask    = tf.constant(np.load("output/preprocessing/pixel_occupancy_mask.npy").astype("float32"))
+    mask    = tf.constant(np.load(DEFAULT_CONFIG.pixel_occupancy_mask_path).astype("float32"))
     samples = sample_edm_batch(
         model,
         class_labels=np.array([0, 1, 5, 12]),

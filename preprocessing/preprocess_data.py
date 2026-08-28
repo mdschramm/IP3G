@@ -2,15 +2,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from tensorflow.keras.utils import to_categorical
-
 import numpy as np
 
 
 from sklearn.metrics import adjusted_rand_score , adjusted_mutual_info_score
 from sklearn.metrics import normalized_mutual_info_score, mutual_info_score
-import keras
-import tensorflow as tf
 from PIL import Image
 import math
 
@@ -20,17 +16,25 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 
-import numpy as np
-
-from tensorflow.keras.utils import to_categorical
 import math
 import os
-from IPython.display import clear_output
 from collections import Counter
 import json
 import time
 
-BASE_DATA_DIR = "output/preprocessing"
+from preprocessing.artifact_paths import SHARED_DIR as BASE_DATA_DIR
+
+
+def to_categorical(y, num_classes):
+    """Minimal numpy replacement for tensorflow.keras.utils.to_categorical.
+
+    Avoids requiring a full TensorFlow/Keras install for the preprocessing
+    module, which only needs one-hot encoding of integer labels here.
+    """
+    y = np.asarray(y, dtype=int)
+    one_hot = np.zeros((len(y), num_classes), dtype=np.float32)
+    one_hot[np.arange(len(y)), y] = 1.0
+    return one_hot
 
 # List of samples and their features and phenotypes
 GTEX_PHENOTYPE = "GTEX_phenotype"

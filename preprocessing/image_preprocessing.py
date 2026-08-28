@@ -345,7 +345,7 @@ def create_multichannel_expression_images_from_tsne(
         pixel_occupancy_mask[px, py, ch] = True
 
     print(f"  Pixel-channel assignment done. "
-          f"Overflow pixels (ch15): {np.sum(overflow_count > 0):,}  "
+          f"Overflow pixels (ch{n_channels - 1}): {np.sum(overflow_count > 0):,}  "
           f"Total occupied positions: {np.sum(pixel_occupancy_mask):,}")
 
     # Fill data for each sample

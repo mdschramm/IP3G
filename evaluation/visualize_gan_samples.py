@@ -16,6 +16,8 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
+from preprocessing.artifact_paths import DEFAULT_CONFIG, Y_PRIMARY_DISEASE_OR_TISSUE_PATH
+
 
 def load_mapping(csv_path):
     """Read latent→phenotype CSV produced by evaluation.py --mode map."""
@@ -148,8 +150,8 @@ def make_comparison_grid(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--real", default="output/preprocessing/resized_expressions.npy")
-    p.add_argument("--real-labels", default="output/preprocessing/y_primary_disease_or_tissue.npy")
+    p.add_argument("--real", default=DEFAULT_CONFIG.resized_expressions_path)
+    p.add_argument("--real-labels", default=Y_PRIMARY_DISEASE_OR_TISSUE_PATH)
     p.add_argument("--syn", default="output/gan/remote/synthetic_resized_expressions.npy")
     p.add_argument("--syn-labels", default="output/gan/remote/synthetic_latent_classes.npy")
     p.add_argument("--out", default="output/gan/remote/real_vs_gan_comparison.png")

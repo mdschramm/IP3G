@@ -9,6 +9,7 @@ import tensorflow as tf
 import numpy as np
 import os
 from preprocessing.filter_utils import filter_classes
+from preprocessing.artifact_paths import DEFAULT_CONFIG
 # import imageio
 # import datetime
 
@@ -16,14 +17,14 @@ LATENT_DIM = 128
 C_CAT_DIM = 54
 NUM_CHANNELS = 1
 BATCH_SIZE = 64
-IMAGE_SIZE = 128
+IMAGE_SIZE = DEFAULT_CONFIG.width
 EPOCHS = 1000
 D_STEPS = 5  # discriminator gradient updates per generator update
 RUN_MODE = os.environ.get("RUN_MODE", "local")
 
 EXCLUDED_CLASSES = [6, 24, 25, 31]
 
-PREPROCESSING_DIR = "output/preprocessing"
+PREPROCESSING_DIR = DEFAULT_CONFIG.artifact_dir
 DATA_DIR = f"output/gan/{RUN_MODE}"
 GENERATOR_MODEL_FILE = f"{DATA_DIR}/generator.keras"
 DISCRIMINATOR_MODEL_FILE = f"{DATA_DIR}/discriminator.keras"
@@ -52,7 +53,7 @@ def initialize_dataset():
 
 
 def get_discriminator_model():
-  img_input = layers.Input(shape=(128, 128, 1))
+  img_input = layers.Input(shape=(IMAGE_SIZE, IMAGE_SIZE, NUM_CHANNELS))
   x = layers.Conv2D(64, (3, 3), strides=(2, 2), padding="same",name='disc_l1')(img_input)
   x = layers.LeakyReLU(alpha=0.2)(x)
   x = layers.Conv2D(128, (3, 3), strides=(2, 2), padding="same")(x)

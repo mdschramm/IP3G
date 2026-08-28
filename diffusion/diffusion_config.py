@@ -7,11 +7,13 @@ sampled from a log-normal, with c_skip/c_out/c_in preconditioning so the loss
 weight w(σ)·c_out²=1 at all noise levels.
 """
 
+from preprocessing.artifact_paths import DEFAULT_CONFIG
+
 # Local configuration - Mac M2, 16GB RAM (architectural sanity check, ~2-3 hours)
 CONFIG_LOCAL = {
     # Model architecture
-    'image_size': 128,
-    'in_channels': 16,
+    'image_size': DEFAULT_CONFIG.width,
+    'in_channels': DEFAULT_CONFIG.channels,
     'channels': [32, 64, 128],           # 3 levels (kept small for M2)
     'num_res_blocks': 2,                  # Per resolution
     'attention_resolutions': [],          # No mid-run attention on M2 (bottleneck only)
@@ -56,7 +58,7 @@ CONFIG_LOCAL = {
     'logvar_channels': 128,
 
     # Data
-    'data_dir': 'output/preprocessing',
+    'data_dir': DEFAULT_CONFIG.artifact_dir,
     'feature_file': 'resized_expressions.npy',
     'label_file': 'y_primary_disease_or_tissue.npy',
     'checkpoint_dir': 'output/diffusion/local/checkpoints',
@@ -66,8 +68,8 @@ CONFIG_LOCAL = {
 # Remote configuration - NVIDIA GPU
 CONFIG_REMOTE = {
     # Model architecture
-    'image_size': 128,
-    'in_channels': 16,
+    'image_size': DEFAULT_CONFIG.width,
+    'in_channels': DEFAULT_CONFIG.channels,
     'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
     'num_res_blocks': 3,
     'attention_resolutions': [16],        # Attention at 16×16 bottleneck resolution
@@ -112,7 +114,7 @@ CONFIG_REMOTE = {
     'logvar_channels': 128,
 
     # Data
-    'data_dir': 'output/preprocessing',
+    'data_dir': DEFAULT_CONFIG.artifact_dir,
     'feature_file': 'resized_expressions.npy',
     'label_file': 'y_primary_disease_or_tissue.npy',
     'checkpoint_dir': 'output/diffusion/remote/checkpoints',
@@ -125,8 +127,8 @@ CONFIG_REMOTE = {
 # gradient norms) before committing to a full 500k-step run.
 CONFIG_DIAGNOSTIC = {
     # Architecture — identical to remote so results are representative
-    'image_size': 128,
-    'in_channels': 16,
+    'image_size': DEFAULT_CONFIG.width,
+    'in_channels': DEFAULT_CONFIG.channels,
     'channels': [32, 64, 128, 256],
     'num_res_blocks': 3,
     'attention_resolutions': [16],
@@ -171,7 +173,7 @@ CONFIG_DIAGNOSTIC = {
     'logvar_channels': 128,
 
     # Data
-    'data_dir': 'output/preprocessing',
+    'data_dir': DEFAULT_CONFIG.artifact_dir,
     'feature_file': 'resized_expressions.npy',
     'label_file': 'y_primary_disease_or_tissue.npy',
     'checkpoint_dir': 'output/diffusion/diagnostic/checkpoints',

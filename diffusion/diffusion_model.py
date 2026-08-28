@@ -641,7 +641,7 @@ def build_unet(config):
     h = MPConv2D(channels[0], 3)(x_input)
     # Project binary mask into feature space (use_bias=False so unoccupied positions
     # contribute exactly zero, not a learned offset).
-    h = h + MPConv2D(channels[0], 1, use_bias=False)(tf.cast(mask_input, h.dtype))
+    h = h + MPConv2D(channels[0], 1, use_bias=False)(keras.ops.cast(mask_input, h.dtype))
     
     # Encoder
     skip_connections = []
@@ -717,7 +717,7 @@ def build_unet(config):
     # Hard occupancy enforcement: zero out positions that are structurally empty.
     # Paired with the masked loss in train_step, this guarantees the model never
     # predicts anything at unoccupied channels and is never penalized there.
-    output = output * tf.cast(mask_input, output.dtype)
+    output = output * keras.ops.cast(mask_input, output.dtype)
 
     # Build model — outputs [pred_F, logvar]; logvar is [B,1,1,1], pred_F is [B,H,W,C]
     model = keras.Model(

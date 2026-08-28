@@ -8,33 +8,33 @@ This script orchestrates the full preprocessing pipeline:
 3. Compute minimum bounding rectangle
 4. Rotate, normalize, and scale t-SNE coordinates
 5. Load phenotypes + compute per-gene ANOVA F-statistic importance order
-6. Create 16-channel multichannel expression images from t-SNE coordinates
-7. Pad images to 128×128
+6. Create multichannel expression images from t-SNE coordinates
+7. Pad images to the target size
 7.5. Compute sigma_data (global and occupied) for diffusion config calibration
 8. Prepare one-hot encoded labels
 
-OUTPUT FILES:
-- output/preprocessing/resized_expressions.npy:         (N, 128, 128, 16) float32 images
-- output/preprocessing/pixel_occupancy_mask.npy:        (128, 128, 16) bool
-- output/preprocessing/gene_pixel_channel.npy:          (N_genes, 3) int32
-- output/preprocessing/channel_scales.npy:              (16,) float32
-- output/preprocessing/gene_importance_order.npy:       (N_genes,) int64
-- output/preprocessing/gene_f_stats.npy:                (N_genes,) float32
-- output/preprocessing/sigma_data.json:                 {global, occupied}
-- output/preprocessing/y_primary_disease_or_tissue.npy: (N, N_classes) one-hot
-- output/preprocessing/y_primary_site.npy:              (N, N_classes) one-hot
+OUTPUT FILES — see preprocessing/artifact_paths.py for the full path scheme:
+- Size/channel-independent, always in output/preprocessing/:
+    data.npy, tsne_results.npy, gene_importance_order.npy, gene_f_stats.npy,
+    y_primary_disease_or_tissue.npy, y_primary_site.npy
+- Size/channel-dependent, in output/preprocessing/ for the default 128x128x16
+  config or output/preprocessing/{width}x{height}x{channels}/ otherwise:
+    resized_expressions.npy, pixel_occupancy_mask.npy, gene_pixel_channel.npy,
+    channel_scales.npy, sigma_data.json
 
 USAGE:
     python -m preprocessing.prepare_training_data
+    python -m preprocessing.prepare_training_data --width 256 --height 256 --channels 1
 
 The script uses caching (load_if_not_exists) so intermediate results are saved.
-To force recalculation, delete the cached .npy files in output/preprocessing/
+To force recalculation, delete the cached .npy files in the relevant output directory.
 
-NOTE: t-SNE coordinates are uniformly scaled to fit within 127×127 pixels before
-image creation, so pad_data is the only spatial step needed — no interpolation.
+NOTE: t-SNE coordinates are uniformly scaled to fit within (size-1)×(size-1) pixels
+before image creation, so pad_data is the only spatial step needed — no interpolation.
 Pixel values are exactly [0, 1] per channel in the output.
 """
 
+import argparse
 import json
 import numpy as np
 from preprocessing.preprocess_data import (
@@ -54,8 +54,8 @@ from preprocessing.image_preprocessing import (
     compute_gene_importance_order,
     create_multichannel_expression_images_from_tsne,
     pad_data,
-    TARGET_SIZE
 )
+from preprocessing.artifact_paths import PreprocessingConfig, SHARED_DIR
 
 # Visualization functions (save to PNG files)
 from preprocessing.visualization import plot_tsne, plot_bounding_box, plot_convex_hull
@@ -64,11 +64,26 @@ from scipy.spatial import ConvexHull
 
 if __name__ == "__main__":
     import os
-    OUT = "output/preprocessing"
+
+    parser = argparse.ArgumentParser(
+        description="Prepare GTEx training data as multichannel expression images"
+    )
+    parser.add_argument("--width", type=int, default=PreprocessingConfig().width)
+    parser.add_argument("--height", type=int, default=PreprocessingConfig().height)
+    parser.add_argument("--channels", type=int, default=PreprocessingConfig().channels)
+    args = parser.parse_args()
+
+    config = PreprocessingConfig(width=args.width, height=args.height, channels=args.channels)
+    assert config.width == config.height, "Pipeline assumes a square target image (width == height)"
+    TARGET_SIZE = config.width
+
+    OUT = SHARED_DIR             # size/channel-independent artifacts
+    ARTIFACT_DIR = config.artifact_dir  # size/channel-dependent artifacts
     os.makedirs(OUT, exist_ok=True)
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
 
     print("=" * 80)
-    print("GENE EXPRESSION TO IMAGE PREPROCESSING PIPELINE (16-channel)")
+    print(f"GENE EXPRESSION TO IMAGE PREPROCESSING PIPELINE ({config.tag})")
     print("=" * 80)
 
     print("\n[1/8] Loading gene expression data...")
@@ -136,7 +151,7 @@ if __name__ == "__main__":
         sample_body_site_phenotypes=sample_body_site_phenotypes,
     )
 
-    print("\n[6/8] Creating 16-channel expression images from t-SNE coordinates...")
+    print(f"\n[6/8] Creating {config.channels}-channel expression images from t-SNE coordinates...")
 
     def _create_multichannel(**kwargs):
         # Wrapper so load_if_not_exists can cache only the image array;
@@ -147,17 +162,18 @@ if __name__ == "__main__":
             gene_importance_order=kwargs['gene_importance_order'],
             w=kwargs['w'],
             h=kwargs['h'],
+            n_channels=config.channels,
         )
         # Save the side-channel artifacts immediately (not cached by load_if_not_exists)
-        np.save(f"{OUT}/pixel_occupancy_mask.npy", pom)
-        np.save(f"{OUT}/gene_pixel_channel.npy", gpc)
-        np.save(f"{OUT}/channel_scales.npy", cs)
-        print(f"  Saved: pixel_occupancy_mask.npy  gene_pixel_channel.npy  channel_scales.npy")
+        np.save(config.pixel_occupancy_mask_path, pom)
+        np.save(config.gene_pixel_channel_path, gpc)
+        np.save(config.channel_scales_path, cs)
+        print(f"  Saved: {config.pixel_occupancy_mask_path}, {config.gene_pixel_channel_path}, {config.channel_scales_path}")
         print(f"  Occupancy mask shape: {pom.shape}  occupied: {pom.sum():,} / {pom.size:,} positions")
-        print(f"  channel_scales (first 8): {cs[:8]}")
+        print(f"  channel_scales (first {min(8, config.channels)}): {cs[:8]}")
         return data
 
-    data = load_if_not_exists(f"{OUT}/unpadded_expressions.npy",
+    data = load_if_not_exists(config.unpadded_expressions_path,
         _create_multichannel,
         sample_gene_expressions=sample_gene_expressions,
         normalized_tsne=normalized_tsne,
@@ -178,22 +194,22 @@ if __name__ == "__main__":
 
     # Update gene_pixel_channel spatial coords to padded coordinate space.
     # Idempotent: if max x-coord already exceeds w, the shift was already applied.
-    gpc = np.load(f"{OUT}/gene_pixel_channel.npy")
+    gpc = np.load(config.gene_pixel_channel_path)
     if int(gpc[:, 0].max()) <= w:
         gpc[:, 0] += left_padd
         gpc[:, 1] += top_padd
-        np.save(f"{OUT}/gene_pixel_channel.npy", gpc)
+        np.save(config.gene_pixel_channel_path, gpc)
         print(f"  Updated gene_pixel_channel: shifted coords by left={left_padd}, top={top_padd}")
 
     # Pad the occupancy mask to match — it was saved with the pre-padding spatial dims.
     # pad_data expects (N, H, W, C); wrap with [None] / unwrap with [0].
-    occ_mask_unpadded = np.load(f"{OUT}/pixel_occupancy_mask.npy")
+    occ_mask_unpadded = np.load(config.pixel_occupancy_mask_path)
     if occ_mask_unpadded.shape[:2] != (TARGET_SIZE, TARGET_SIZE):
         occ_mask_padded = pad_data(occ_mask_unpadded[None], TARGET_SIZE)[0]
-        np.save(f"{OUT}/pixel_occupancy_mask.npy", occ_mask_padded)
+        np.save(config.pixel_occupancy_mask_path, occ_mask_padded)
         print(f"  Padded occupancy mask: {occ_mask_unpadded.shape} → {occ_mask_padded.shape}")
 
-    out_path = f"{OUT}/resized_expressions.npy"
+    out_path = config.resized_expressions_path
     if not os.path.exists(out_path):
         np.save(out_path, data.astype(np.float32))
         print(f"  Saved: {out_path}")
@@ -204,8 +220,8 @@ if __name__ == "__main__":
     print(f"  Pixel value range: [{np.min(data):.4f}, {np.max(data):.4f}]")
 
     print("\n[7.5/8] Computing sigma_data for diffusion config calibration...")
-    occ_mask_path = f"{OUT}/pixel_occupancy_mask.npy"
-    sigma_data_path = f"{OUT}/sigma_data.json"
+    occ_mask_path = config.pixel_occupancy_mask_path
+    sigma_data_path = config.sigma_data_path
     if not os.path.exists(sigma_data_path):
         if os.path.exists(occ_mask_path):
             occ_mask = np.load(occ_mask_path)          # (128, 128, 16) bool
@@ -252,9 +268,10 @@ if __name__ == "__main__":
     print(f"  - Images:                   {data.shape}  (N, H, W, C)")
     print(f"  - Labels (disease/tissue):  {y_train_primary_disease_or_tissue.shape}")
     print(f"  - Labels (site):            {y_train_primary_site.shape}")
-    print(f"\nOutput files saved in {OUT}/")
+    print(f"\nShared (size-independent) artifacts saved in {OUT}/")
+    print(f"  data.npy, tsne_results.npy, samples.npy, gene_importance_order.npy,")
+    print(f"  gene_f_stats.npy, y_primary_disease_or_tissue.npy, y_primary_site.npy")
+    print(f"\n{config.tag} artifacts saved in {ARTIFACT_DIR}/")
     print(f"  resized_expressions.npy, pixel_occupancy_mask.npy,")
-    print(f"  gene_pixel_channel.npy, channel_scales.npy,")
-    print(f"  gene_importance_order.npy, gene_f_stats.npy, sigma_data.json,")
-    print(f"  y_primary_disease_or_tissue.npy, y_primary_site.npy")
+    print(f"  gene_pixel_channel.npy, channel_scales.npy, sigma_data.json")
     print("\nReady for model training.")

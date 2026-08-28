@@ -1,6 +1,8 @@
 # Diffusion Model Architecture
 
-Conditional image generation on 128×128 grayscale GTEx gene expression images.
+Conditional image generation on 128×128 GTEx gene expression images (16 channels by
+default; resolution and channel count are both configurable — see
+`preprocessing/artifact_paths.py`).
 54 tissue/disease classes + 1 unconditional token for classifier-free guidance.
 Architecture family: EDM2 (Karras et al. 2023) U-Net with magnitude-preserving (MP) layers.
 
@@ -21,15 +23,19 @@ x_t = x_0 + σ·ε,    ε ~ N(0, I)
 At training, σ is drawn from a truncated log-normal:
 
 ```
-ln(σ) ~ N(P_mean=-2.0, P_std=1.2),   σ ∈ [0.002, 80.0]
+ln(σ) ~ N(P_mean=-1.77, P_std=1.2),   σ ∈ [0.002, 80.0]
 ```
 
-`exp(P_mean) ≈ 0.135 ≈ σ_data`, so the distribution is centred near the data scale,
-concentrating gradient signal where the denoiser is most uncertain.
+`exp(P_mean) ≈ 0.171 ≈ σ_data`, so the distribution is centred near the data scale,
+concentrating gradient signal where the denoiser is most uncertain. (Already re-centred
+from the EDM2 paper default P_mean=-2.0 to match this dataset's measured σ_data — see
+§8 item 7.)
 
 ### Preconditioning scalars
 
-All are deterministic functions of σ and the measured data standard deviation σ_data = 0.139:
+All are deterministic functions of σ and the measured data standard deviation
+σ_data = 0.1709 (128×128×16 config; recompute from `sigma_data.json` if width, height,
+or channel count change):
 
 | Scalar | Formula | Purpose |
 |--------|---------|---------|
@@ -108,6 +114,23 @@ output = cast((1 + scale_raw) · h + shift, x.dtype)
 passthrough. Conditioning learns to deviate from identity only when the loss requires it,
 preventing early instability (DiT adaLN-Zero pattern).
 
+### Occupancy mask conditioning
+
+A third conditioning signal, separate from the time/class vector above: the per-pixel
+occupancy mask (1 where a gene actually maps to that pixel, 0 elsewhere — produced
+alongside `resized_expressions.npy` by `preprocessing.prepare_training_data`). It's
+projected into feature space and added right after the initial convolution:
+
+```
+h = MPConv2D(ch[0], 3)(x_noisy)
+h = h + MPConv2D(ch[0], 1, use_bias=False)(occupancy_mask)
+```
+
+`use_bias=False` so unoccupied positions contribute exactly zero, not a learned offset —
+the model can only receive positive evidence that a pixel is real, never a bias term that
+would leak information into structurally-empty positions. See §3 for the matching
+output-side enforcement and §6 for how the mask is used during sampling.
+
 ---
 
 ## 3. Network Architecture
@@ -117,19 +140,25 @@ preventing early instability (DiT adaLN-Zero pattern).
 ### Inputs and outputs
 
 ```
-Inputs:  x_noisy      (B, 128, 128, 1)   float32  — c_in-scaled noisy image
-         timesteps    (B,)               float32  — c_noise = ln(σ)/4
-         class_labels (B,)               int32    — tissue class or unconditional token
+Inputs:  x_noisy        (B, 128, 128, 16)  float32  — c_in-scaled noisy image
+         timesteps      (B,)               float32  — c_noise = ln(σ)/4
+         class_labels   (B,)               int32    — tissue class or unconditional token
+         occupancy_mask (B, 128, 128, 16)  float32  — 1 at real gene-pixel positions, 0 elsewhere
 
-Outputs: F_pred       (B, 128, 128, 1)   — denoising residual (see §1)
-         logvar       (B, 1, 1, 1)       — per-σ log variance (broadcasts over spatial dims)
+Outputs: F_pred         (B, 128, 128, 16)  — denoising residual (see §1); hard-masked to
+                                              0 at unoccupied positions (see below)
+         logvar         (B, 1, 1, 1)       — per-σ log variance (broadcasts over spatial dims)
 ```
+
+Shapes shown are the current default (128×128×16); all four scale with whatever
+`image_size`/`in_channels` the active config specifies.
 
 ### U-Net structure (remote/diagnostic config: channels = [32, 64, 128, 256])
 
 ```
-x_noisy
-  └─ MPConv2D(ch[0], 3)
+x_noisy                                    occupancy_mask
+  └─ MPConv2D(ch[0], 3)                          │
+       └─ + MPConv2D(ch[0], 1, no bias) ◄─────────┘   [additive mask conditioning, §2]
        └─ Encoder level 0  (128×128, ch=32)
             num_res_blocks × ResNetBlock
             [SelfAttention if resolution in attention_resolutions]
@@ -147,12 +176,21 @@ x_noisy
        └─ Decoder level 2  (32×32)  Upsample; cat(skip_2); ResNetBlocks; clip
        └─ Decoder level 1  (64×64)  Upsample; cat(skip_1); ResNetBlocks; clip
        └─ Decoder level 0  (128×128) Upsample; cat(skip_0); ResNetBlocks; clip
-            └─ GroupNorm(f32) → MPSiLU → MPConv2D(1, 3)  →  F_pred
+            └─ GroupNorm(f32) → MPSiLU → MPConv2D(in_channels, 3) → ×occupancy_mask → F_pred
 ```
 
 Attention resolutions in the remote/diagnostic config: {16} (bottleneck only).
 `act_clip = 256.0` clamps encoder and decoder block outputs to prevent rare FP16 overflow
 spikes from propagating through skip connections.
+
+### Hard occupancy enforcement
+
+The final output is multiplied by the occupancy mask before being returned:
+`output = F_pred × occupancy_mask`. Paired with the masked loss in
+`diffusion_train.py:train_step` (which sums the loss only over occupied positions), this
+guarantees the model never predicts anything at structurally-unoccupied channels and is
+never penalized for whatever it outputs there — the mask is enforced architecturally,
+not just encouraged by the loss.
 
 ### Logvar head isolation
 
@@ -278,8 +316,17 @@ where fine-grained details emerge and the model is most sensitive to step size.
 x ~ N(0, σ_max² · I)
 ```
 
-At σ = 80 >> σ_data = 0.139, the data signal is negligible: x_t ≈ σ·ε, so this is the
+At σ = 80 >> σ_data = 0.1709, the data signal is negligible: x_t ≈ σ·ε, so this is the
 correct marginal distribution of the forward process. After scaling: `c_in · x ~ N(0, I)`.
+
+### Occupancy masking during sampling
+
+The initial noise, and the state after every Euler/Heun step, is masked to the same
+occupancy pattern used in training: `x = x * occupancy_mask` (`sample_edm_batch` in
+`diffusion_edm_sample.py`). This keeps structural zeros exactly zero throughout the ODE
+trajectory rather than relying on the network to learn them from noise at every step. If
+no mask is supplied, sampling falls back to a dense all-ones mask (backward-compatible
+with single-channel, unmasked checkpoints).
 
 ### Per-step denoiser (`_denoise`)
 
@@ -351,8 +398,9 @@ amplifying the guidance signal through the c_out scaling factor.
 |--------|------------|---------------------|
 | Time embedding | MPFourier → main conditioning path | Sinusoidal embeddings → MPLinear MLP; MPFourier only for logvar head |
 | Conditioning layer | Adaptive LayerNorm (AdaLN) | Adaptive GroupNorm (AdaGN) — better for spatial features at small channel counts |
-| Data domain | Natural images (CIFAR-10, ImageNet) at multiple resolutions | Single-channel 128×128 gene expression matrices |
-| σ_data | ~0.5 (natural images) | 0.139 (measured from GTEx dataset) |
+| Data domain | Natural images (CIFAR-10, ImageNet) at multiple resolutions | Multichannel gene expression images (16-channel × 128×128 default); resolution and channel count are both config-driven |
+| σ_data | ~0.5 (natural images) | 0.1709 (measured from GTEx dataset, 128×128×16 config — recompute per config via `sigma_data.json`) |
+| Structural masking | Not present (dense images) | Occupancy mask conditions the input, hard-zeroes the output, and restricts the training loss to real (non-structural-zero) positions — needed because gene-expression images are majority empty (§2, §3) |
 | Network scale | Hundreds of channels; very deep | channels=[32,64,128,256]; 3 ResNet blocks per level |
 | Weight normalisation | Per-filter unit-norm, Config D, ε=1e-4 | Same (MPConv2D/MPLinear) |
 | Logvar head | MPFourier → MPLinear scalar | Same design; branch isolation from spatial features is explicit |
@@ -365,65 +413,97 @@ amplifying the guidance signal through the c_out scaling factor.
 
 ## 8. Suggested Next Steps
 
-### Architecture
+Ordered by where the project actually stands, not just each item's individual merit.
+`build_unet()` did not construct successfully at *any* resolution until 2026-08-28:
+`tf.cast` was applied directly to the `mask_input` KerasTensor placeholder outside any
+layer's `call()`, which the installed Keras 3.10 rejects under the Functional API (fixed —
+now `keras.ops.cast`, `diffusion_model.py:644,720`). Per the commit history, the masked
+architecture has never completed a validated training run. Items below that assume a
+working baseline are sequenced after that prerequisite, not before it.
 
-**1. MPFourier for main time conditioning**
-Replace `get_sinusoidal_embeddings` with `MPFourier` (already implemented in
-`diffusion_model.py` for the logvar head) in the main `TimeAndClassEmbedding` path.
-This completes the MP chain from input to conditioning and matches EDM2 Config D exactly.
-The change is contained to `TimeAndClassEmbedding.build`.
+### Do first
 
-**2. AdaGN → Adaptive LayerNorm (AdaLN)**
-EDM2 recommends AdaLN over AdaGN. AdaLN normalises over all channels (not groups),
-which is simpler and removes the need for float32 GroupNorm — eliminating the FP16/FP32
-casting around each AdaGN block. Risk: may need retuning of res_balance since the
-norm statistics change.
+**0. Complete one successful training run on the current masked architecture.**
+Confirm loss decreases, the EMA/mixed-precision/AdaGN diagnostics (§5) stay in their
+healthy ranges, and a sampled image round-trips sensibly through the occupancy mask
+(§2, §3, §6). This is a prerequisite for most of Tier 2 and all of Tier 3 below —
+items 3, 4, 6, 8, 9, and 10 each need either a validated baseline to compare against
+or a trained model to generate/distil from — not an independent item on the list.
 
-**3. Channel attention at bottleneck**
-Add squeeze-excitation or channel-MHA at the 16×16 bottleneck to capture global
-gene-expression correlations that spatial MHA misses. Gene expression is fundamentally
-a channel (gene) co-expression signal, making this a domain-motivated addition.
+### Tier 1 — safe, cheap, valuable regardless of what else changes
 
-### Training
+**1. EMA of Adam second moments** *(training)*
+Currently only weight EMA is tracked. Adam's second moment accumulates from scratch
+after every resume, causing a warm-up period with effectively too-large step sizes.
+Saving and restoring optimizer state alongside the EMA checkpoint removes this —
+contained, low-risk, and a direct payoff for a project that resumes/restarts training
+frequently (see commit history).
 
-**4. EMA of Adam second moments**
-Currently only weight EMA is tracked. Adam's m2 accumulates from scratch after a resume,
-causing a warm-up period with large effective learning rates. Saving and restoring the
-optimizer state alongside the EMA checkpoint would eliminate this.
+**2. Class-frequency-weighted CFG dropout** *(training)*
+`excluded_classes: [6, 24, 25, 31]` only removes the n<10 tail; classes with n=28–60
+(e.g. class 34, n=28) remain in training under a flat 10% unconditional dropout rate,
+which may be too aggressive for them specifically. A per-class rate proportional to
+1/√n would protect rare-class CFG signal without touching common classes. Cheap,
+well-scoped, and directly testable once a baseline run exists to compare against.
 
-**5. Re-center P_mean / P_std for GTEx**
-P_mean = −2.0, P_std = 1.2 are paper defaults calibrated for natural images. Computing
-the empirical noise sensitivity curve on GTEx (denoiser MSE as a function of σ) and
-re-centering P_mean to the peak of that curve could improve gradient efficiency,
-especially for the sparse high-σ regime where background dominates.
+### Tier 2 — real value, sequence after a validated baseline
 
-**6. Class-frequency-weighted CFG dropout**
-Several remaining classes have n < 50. A fixed 10% unconditional dropout rate may be
-too high for these, causing unconditional mode collapse. A per-class dropout rate
-proportional to 1/√n would preserve CFG signal for rare classes without hurting
-common ones.
+**3. Channel attention at bottleneck** *(architecture)*
+Add squeeze-excitation or channel-MHA at the 16×16 bottleneck to capture cross-gene
+correlations that spatial MHA misses. More motivated now than when originally proposed:
+a correlation check on the 16-channel scheme's overflow channel found its collapsed
+(averaged) genes are barely correlated with each other (median r≈0.05, close to the
+random-gene-pair baseline of ~0.07) — a channel-attention mechanism is one plausible way
+to let the model exploit gene co-expression structure that pixel-averaging currently
+just discards.
 
-### Sampling
-
-**7. Evaluate stochastic SDE sampling**
-The current ODE sampler (deterministic, η = 0) can accumulate early denoising errors.
-The EDM SDE variant (η > 0) injects noise at each step and can recover from these.
-For sparse gene-expression images where background should be near-zero, the stochastic
-path may reduce residual background fog at low guidance scales.
-
-**8. Consistency distillation**
-Song et al. 2023 shows that an EDM-trained model can be distilled into a consistency
-model requiring 1–4 inference steps vs the current 40 (80 model evals with Heun).
-This would make generation ~20× faster and is compatible with the existing U-Net.
-
-### Evaluation
-
-**9. FID / KID against held-out real images**
+**4. FID / KID against held-out real images** *(evaluation)*
 The current evaluation pipeline (classifier confidence / class fidelity) measures how
-well generated images are classified, not how realistic they look. FID or KID against
-a held-out split of real GTEx images would give a complementary distribution-level metric.
+well generated images are classified, not how realistic they look as distributions.
+Literal Inception-based FID doesn't transfer to this domain — there's no meaningful
+gene-expression feature extractor pretrained elsewhere. Adapt it instead: use the
+existing trained tissue classifier's penultimate-layer activations as the feature space
+for a Fréchet distance.
 
-**10. MP ablation**
-Run identical training with standard Conv2D / Linear instead of MPConv2D / MPLinear to
-quantify the contribution of weight normalisation on this dataset. This would validate
-(or refute) the necessity of the MP design for gene-expression data specifically.
+**5. MPFourier for main time conditioning** *(architecture)*
+Replace `get_sinusoidal_embeddings` with `MPFourier` (already implemented for the logvar
+head) in the main `TimeAndClassEmbedding` path. Completes the MP chain end-to-end and
+matches EDM2 Config D exactly. Contained to `TimeAndClassEmbedding.build`; safe to bundle
+into a later cleanup pass rather than treat as urgent.
+
+### Tier 3 — defer
+
+**6. AdaGN → Adaptive LayerNorm (AdaLN)** *(architecture)*
+EDM2 recommends AdaLN over AdaGN — it normalises over all channels rather than groups,
+removing the float32 GroupNorm casting overhead. Real risk: the codebase carries visible
+scar tissue from past instability (§4 Motivation, QKNorm, act_clip, adaLN-Zero, fp32 EMA),
+all tuned around AdaGN's current behaviour, and `res_balance` would likely need retuning
+since the norm statistics change. Treat as a controlled experiment against a working
+baseline, not a default swap.
+
+**7. Re-center P_mean / P_std for GTEx** *(training)*
+Partially done already: `diffusion_config.py` now sets `P_mean = -1.77`
+(≈ ln(σ_data = 0.1709), not the EDM2 paper default of -2.0 — see §1). The remaining,
+more sophisticated piece — fitting P_mean to the peak of the empirical
+denoiser-MSE-vs-σ curve rather than just matching σ_data — is a refinement, not a
+correctness fix, and premature while resolution/channel config may still change
+(σ_data measured 0.1586–0.1603 for 256²/512² single-channel candidates evaluated
+separately — close enough that neither choice needs dramatic rework).
+
+**8. Evaluate stochastic SDE sampling** *(sampling)*
+The deterministic ODE sampler (η=0) can accumulate early denoising errors; the EDM SDE
+variant (η>0) injects noise per step and can recover from them. Plausibly useful for
+reducing residual background fog in sparse images specifically — but is a sampling-time
+optimisation for a model that doesn't yet have a completed training run to sample from.
+
+**9. Consistency distillation** *(sampling)*
+Song et al. 2023: an EDM-trained model can be distilled into a 1–4 step consistency
+model (~20× faster than the current 40-step/80-eval Heun sampler). Requires a trained
+model to distil from first — correctly sequenced last regardless of individual merit.
+
+**10. MP ablation** *(evaluation)*
+Retrain with standard Conv2D/Linear instead of MPConv2D/MPLinear to quantify their
+contribution on this dataset specifically. Useful for a writeup, not for engineering
+decisions — the documented instability incidents (§4) already constitute strong evidence
+MP matters; a controlled ablation is confirmatory, not decision-blocking, and costs a
+full retrain to run.

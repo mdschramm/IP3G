@@ -26,7 +26,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-PREPROCESSING_DIR = "output/preprocessing"
+from preprocessing.artifact_paths import DEFAULT_CONFIG
+
+PREPROCESSING_DIR = DEFAULT_CONFIG.artifact_dir
 DIFFUSION_DIR     = "output/diffusion/diagnostic"
 OUTPUT_DIR        = "evaluation/fidelity_analysis"
 

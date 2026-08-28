@@ -3,8 +3,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
+from preprocessing.artifact_paths import DEFAULT_CONFIG, Y_PRIMARY_DISEASE_OR_TISSUE_PATH
+
 def get_class_stats():
-    y = np.load('output/preprocessing/y_primary_disease_or_tissue.npy')
+    y = np.load(Y_PRIMARY_DISEASE_OR_TISSUE_PATH)
     # convert from 1hot encoding
     y = np.argwhere(y == 1)[:, 1]
     print(f'Total samples: {len(y)}')
@@ -92,8 +94,8 @@ def show_example_images_from_each_class(n=4, selected_classes=None):
     # Create evaluation/explore if doesn't already exist
     if not os.path.exists('evaluation/explore'):
         os.makedirs('evaluation/explore')
-    x = np.load('output/preprocessing/resized_expressions.npy')
-    y = np.load('output/preprocessing/y_primary_disease_or_tissue.npy')
+    x = np.load(DEFAULT_CONFIG.resized_expressions_path)
+    y = np.load(Y_PRIMARY_DISEASE_OR_TISSUE_PATH)
     # convert from 1hot encoding
     y = np.argwhere(y == 1)[:, 1]
     unique = np.unique(y)
@@ -120,15 +122,15 @@ def show_pixel_distribution():
     """
     1. Transform 
     """
-    # X_train = np.load('output/preprocessing/resized_expressions.npy').astype(np.float32)
-    X_train = np.load('output/preprocessing/resized_expressions.npy').astype(np.float32)
+    # X_train = np.load(DEFAULT_CONFIG.resized_expressions_path).astype(np.float32)
+    X_train = np.load(DEFAULT_CONFIG.resized_expressions_path).astype(np.float32)
     plt.hist(X_train.flatten(), bins=100)
     plt.savefig('evaluation/explore/pixel_distribution.png')
 
 # show_pixel_distribution()
 
 def show_stats():
-    X_train = np.load('output/preprocessing/resized_expressions.npy').astype(np.float32)
+    X_train = np.load(DEFAULT_CONFIG.resized_expressions_path).astype(np.float32)
     # Shape
     print(f"Shape: {X_train.shape}")
     # Range

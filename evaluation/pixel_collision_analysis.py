@@ -12,15 +12,21 @@ then reports:
      whether the pixel is a singleton (1 gene) or a collision (>1 genes)
 
 USAGE:
-    python -m preprocessing.pixel_collision_analysis
+    python -m evaluation.pixel_collision_analysis
+    python -m evaluation.pixel_collision_analysis --width 256 --height 256 --channels 1
+    python -m evaluation.pixel_collision_analysis --width 512 --height 512 --channels 1
 
-REQUIRES (all in output/preprocessing/):
-    tsne_results.npy
-    resized_expressions.npy
-    sample_body_site_phenotypes.npy
+REQUIRES:
+    output/preprocessing/tsne_results.npy                      (shared, size-independent)
+    output/preprocessing/sample_body_site_phenotypes.npy       (shared, size-independent)
+    <config.artifact_dir>/resized_expressions.npy               (size/channel-dependent;
+        only needed for the discrimination analysis, and only when channels == 1 —
+        with channels > 1 there's no single per-pixel value to run ANOVA on, so that
+        step is skipped)
 """
 
 import os
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import ConvexHull
@@ -30,26 +36,31 @@ from preprocessing.image_preprocessing import (
     minimum_bounding_rectangle,
     rotate,
     compute_rotation,
-    TARGET_SIZE,
 )
-
-OUT = "output/preprocessing"
+from preprocessing.artifact_paths import (
+    PreprocessingConfig,
+    TSNE_RESULTS_PATH,
+    SAMPLE_BODY_SITE_PHENOTYPES_PATH,
+)
 
 
 # ---------------------------------------------------------------------------
 # Step 1 – reproduce the coordinate pipeline from prepare_training_data.py
 # ---------------------------------------------------------------------------
 
-def derive_integer_pixel_coords(tsne_results: np.ndarray) -> np.ndarray:
+def derive_integer_pixel_coords(tsne_results: np.ndarray, target_size: int) -> np.ndarray:
     """
     Run bounding-box → rotate → normalize → scale → floor on tsne_results.
 
-    Mirrors lines 74-93 of prepare_training_data.py exactly so that the
-    integer pixel coordinates here match what create_expression_images_from_tsne
-    used when building resized_expressions.npy.
+    Mirrors the scale/rotate/normalize steps of prepare_training_data.py exactly
+    so that the integer pixel coordinates here match what
+    create_multichannel_expression_images_from_tsne used when building
+    resized_expressions.npy for the same target_size.
 
     Args:
         tsne_results: Raw t-SNE output, shape (N_genes, 2)
+        target_size: Target image width/height in pixels (the pipeline assumes
+            a square grid, same as preprocessing.artifact_paths.PreprocessingConfig)
 
     Returns:
         pixel_coords: Integer pixel coordinates, shape (N_genes, 2)
@@ -60,10 +71,10 @@ def derive_integer_pixel_coords(tsne_results: np.ndarray) -> np.ndarray:
     rotated = rotate(tsne_results, origin=bbox[0], theta=theta)
     normalized = rotated - np.min(rotated, axis=0)
 
-    scale = (TARGET_SIZE - 1) / np.max(normalized)
+    scale = (target_size - 1) / np.max(normalized)
     normalized = normalized * scale
 
-    # create_expression_images_from_tsne casts with int(), which truncates
+    # create_multichannel_expression_images_from_tsne casts with int(), which truncates
     pixel_coords = normalized.astype(int)
     return pixel_coords
 
@@ -91,7 +102,7 @@ def count_genes_per_pixel(pixel_coords: np.ndarray):
 # Step 3 – summary statistics and histogram
 # ---------------------------------------------------------------------------
 
-def print_count_statistics(counts: np.ndarray) -> None:
+def print_count_statistics(counts: np.ndarray, target_size: int) -> None:
     n_pixels = len(counts)
     n_genes  = counts.sum()
     n_collisions = np.sum(counts > 1)
@@ -101,7 +112,7 @@ def print_count_statistics(counts: np.ndarray) -> None:
     print("GENE-TO-PIXEL COLLISION STATISTICS")
     print(f"{'='*60}")
     print(f"Total genes mapped   : {n_genes:,}")
-    print(f"Unique pixels used   : {n_pixels:,}  (of {TARGET_SIZE**2:,} available)")
+    print(f"Unique pixels used   : {n_pixels:,}  (of {target_size**2:,} available)")
     print(f"Collision pixels (>1): {n_collisions:,}  ({100*n_collisions/n_pixels:.1f}% of used pixels)")
     print(f"Genes in collisions  : {genes_in_collisions:,}  ({100*genes_in_collisions/n_genes:.1f}% of all genes)")
 
@@ -160,17 +171,23 @@ def collision_discrimination_analysis(
     expressions: np.ndarray,
     phenotypes: np.ndarray,
     out_path: str,
+    target_size: int,
 ) -> None:
     """
     For every active pixel, compute a one-way ANOVA F-statistic across tissue
     classes using the pixel's expression values in resized_expressions.npy.
     Then compare the F distribution for collision vs singleton pixels.
 
+    Only meaningful for single-channel (channels == 1) configs — with more than
+    one channel there's no single per-pixel value to run ANOVA on.
+
     Args:
         pixel_coords:  (N_genes, 2)  integer gene→pixel map
-        expressions:   (N_samples, 128, 128)  from resized_expressions.npy
+        expressions:   (N_samples, target_size, target_size)  single-channel,
+            from resized_expressions.npy with the trailing channel dim squeezed
         phenotypes:    (N_samples,)  tissue class label per sample
         out_path:      path to save the output figure
+        target_size:   image width/height in pixels (square grid)
     """
     # Build the collision mask on the full 128×128 grid
     unique_pixels, counts = count_genes_per_pixel(pixel_coords)
@@ -188,11 +205,11 @@ def collision_discrimination_analysis(
     print(f"  Min samples per class: {min(np.sum(labels == i) for i in range(n_classes))}")
     print(f"  Computing ANOVA F-statistic for {len(unique_pixels):,} active pixels …")
 
-    f_stats     = np.full((TARGET_SIZE, TARGET_SIZE), np.nan)
-    collision_mask = np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=bool)
+    f_stats     = np.full((target_size, target_size), np.nan)
+    collision_mask = np.zeros((target_size, target_size), dtype=bool)
 
     for (px, py), cnt in zip(unique_pixels, counts):
-        if px >= TARGET_SIZE or py >= TARGET_SIZE:
+        if px >= target_size or py >= target_size:
             continue
 
         pixel_vals = expressions[:, px, py]   # (N_samples,)
@@ -266,37 +283,64 @@ def collision_discrimination_analysis(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Gene-to-pixel collision analysis for a given image size/channel config"
+    )
+    parser.add_argument("--width", type=int, default=PreprocessingConfig().width)
+    parser.add_argument("--height", type=int, default=PreprocessingConfig().height)
+    parser.add_argument("--channels", type=int, default=PreprocessingConfig().channels)
+    args = parser.parse_args()
+
+    config = PreprocessingConfig(width=args.width, height=args.height, channels=args.channels)
+    assert config.width == config.height, "Pipeline assumes a square target image (width == height)"
+    target_size = config.width
+    OUT = config.artifact_dir
+    os.makedirs(OUT, exist_ok=True)
+
+    print(f"Config: {config.tag}\n")
+
     print("[1/4] Loading cached t-SNE results …")
-    tsne_results = np.load(f"{OUT}/tsne_results.npy")
+    tsne_results = np.load(TSNE_RESULTS_PATH)
     print(f"  tsne_results shape: {tsne_results.shape}  (N_genes × 2)")
 
     print("\n[2/4] Deriving integer pixel coordinates …")
-    pixel_coords = derive_integer_pixel_coords(tsne_results)
+    pixel_coords = derive_integer_pixel_coords(tsne_results, target_size)
     print(f"  Pixel coordinate range: x=[{pixel_coords[:,0].min()}, {pixel_coords[:,0].max()}], "
           f"y=[{pixel_coords[:,1].min()}, {pixel_coords[:,1].max()}]")
 
     unique_pixels, counts = count_genes_per_pixel(pixel_coords)
-    print_count_statistics(counts)
+    print_count_statistics(counts, target_size)
 
     print("\n[3/4] Saving collision histogram …")
     plot_count_histogram(counts, out_path=f"{OUT}/pixel_collision_histogram.png")
 
     print("\n[4/4] Loading expression images and phenotypes for discrimination analysis …")
-    expr_path       = f"{OUT}/resized_expressions.npy"
-    phenotype_path  = f"{OUT}/sample_body_site_phenotypes.npy"
-
-    if not os.path.exists(expr_path):
-        print(f"  SKIP: {expr_path} not found — run prepare_training_data.py first.")
-    elif not os.path.exists(phenotype_path):
-        print(f"  SKIP: {phenotype_path} not found — run prepare_training_data.py first.")
+    if config.channels != 1:
+        print(f"  SKIP: discrimination analysis only applies to single-channel configs "
+              f"(config has {config.channels} channels) — there's no single per-pixel "
+              f"value to run ANOVA on when genes are split across channels.")
     else:
-        expressions = np.load(expr_path)
-        phenotypes  = np.load(phenotype_path, allow_pickle=True)
-        collision_discrimination_analysis(
-            pixel_coords=pixel_coords,
-            expressions=expressions,
-            phenotypes=phenotypes,
-            out_path=f"{OUT}/pixel_collision_discrimination.png",
-        )
+        expr_path       = config.resized_expressions_path
+        phenotype_path  = SAMPLE_BODY_SITE_PHENOTYPES_PATH
+
+        if not os.path.exists(expr_path):
+            print(f"  SKIP: {expr_path} not found — run "
+                  f"`python -m preprocessing.prepare_training_data --width {config.width} "
+                  f"--height {config.height} --channels {config.channels}` first.")
+        elif not os.path.exists(phenotype_path):
+            print(f"  SKIP: {phenotype_path} not found — run prepare_training_data.py first.")
+        else:
+            expressions = np.load(expr_path)
+            if expressions.ndim == 4:
+                # (N, H, W, 1) → (N, H, W); channels==1 here so this is lossless
+                expressions = expressions[..., 0]
+            phenotypes  = np.load(phenotype_path, allow_pickle=True)
+            collision_discrimination_analysis(
+                pixel_coords=pixel_coords,
+                expressions=expressions,
+                phenotypes=phenotypes,
+                out_path=f"{OUT}/pixel_collision_discrimination.png",
+                target_size=target_size,
+            )
 
     print("\nDone.")

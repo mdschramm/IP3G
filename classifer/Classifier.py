@@ -20,9 +20,10 @@ from tensorflow.keras import backend as K
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from preprocessing.filter_utils import filter_classes, EXCLUDED_CLASSES
+from preprocessing.artifact_paths import DEFAULT_CONFIG
 
 RUN_MODE = os.environ.get("RUN_MODE", "local")
-PREPROCESSING_DIR = "output/preprocessing"
+PREPROCESSING_DIR = DEFAULT_CONFIG.artifact_dir
 DATA_DIR = f"output/classifier/{RUN_MODE}"
 FEATURE_FILE = "resized_expressions.npy"
 LABEL_FILE = "y_primary_disease_or_tissue.npy"
@@ -55,10 +56,10 @@ def f1_m(y_true, y_pred):
     recall = recall_m(y_true, y_pred)
     return 2*((precision*recall)/(precision+recall+K.epsilon()))
 
-def get_model(num_classes):
+def get_model(num_classes, input_shape=DEFAULT_CONFIG.image_shape):
     model = Sequential()
 
-    model.add(Conv2D(32 , kernel_size=15 , strides=2 , padding="same" , input_shape=(128,128,16)))
+    model.add(Conv2D(32 , kernel_size=15 , strides=2 , padding="same" , input_shape=input_shape))
     model.add(LeakyReLU(alpha=0.2))
 
             

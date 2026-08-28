@@ -4,6 +4,8 @@ import json
 import numpy as np
 import tensorflow as tf
 
+from preprocessing.artifact_paths import DEFAULT_CONFIG
+
 # Global normalization constants (computed from full dataset)
 DATA_MIN = None
 DATA_MAX = None
@@ -202,7 +204,7 @@ def apply_classifier_free_dropout(class_labels, num_classes, dropout_rate=0.15):
     return tf.where(mask, unconditional_token, class_labels)
 
 
-def _round_trip_test(data_path="output/preprocessing/resized_expressions.npy"):
+def _round_trip_test(data_path=DEFAULT_CONFIG.resized_expressions_path):
     """Validate that forward_transform → denormalize is the identity (within fp32 precision)."""
     print("\nRunning normalization round-trip test...")
     X_real = np.load(data_path).astype(np.float32)

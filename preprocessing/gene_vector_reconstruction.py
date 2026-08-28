@@ -1,19 +1,23 @@
 """
-Reverse mapping from 16-channel expression images back to gene expression vectors.
+Reverse mapping from multichannel expression images back to gene expression vectors.
+
+Works for any channel count, including the single-channel (channels=1) configs
+used for the 256x256x1 / 512x512x1 resolution comparison, where it reduces to
+plain per-pixel collision averaging.
 
 Forward normalization chain (see image_preprocessing.create_multichannel_expression_images_from_tsne):
   1. Genes are assigned to pixel-channel slots in descending F-statistic order.
-     Channels 0-14 at each pixel hold exactly one gene; channel 15 holds the
-     arithmetic mean of all overflow genes (>14th gene at that pixel).
+     Channels 0..n_channels-2 at each pixel hold exactly one gene; channel
+     n_channels-1 holds the arithmetic mean of all overflow genes (any gene beyond
+     the n_channels-1'th at that pixel — every gene, when n_channels == 1).
   2. Per-channel normalization: image[i, px, py, k] = raw_expression / channel_scales[k]
 
 Inverse:
   raw_expression = image[i, px, py, k] * channel_scales[k]
 
-Exact for channels 0-14 (one-to-one gene-pixel-channel mapping).
-For channel 15: all overflow genes at a pixel receive the same reconstructed value
-(the pixel average), since individual proportions are lost during the forward mean.
-This affects ~1% of genes (p99 = 16 genes/pixel from t-SNE collision analysis).
+Exact for channels 0..n_channels-2 (one-to-one gene-pixel-channel mapping), and for
+any gene alone in the overflow channel at its pixel. Lossy only where 2+ genes share
+the overflow channel at the same pixel — see compute_exact_mask() below.
 
 USAGE:
     from preprocessing.gene_vector_reconstruction import (
@@ -26,6 +30,8 @@ USAGE:
 """
 
 import numpy as np
+
+from preprocessing.artifact_paths import DEFAULT_CONFIG
 
 
 def reconstruct_gene_vectors(images, gene_pixel_channel, channel_scales):
@@ -57,7 +63,44 @@ def reconstruct_gene_vectors(images, gene_pixel_channel, channel_scales):
     return gene_vectors
 
 
-def load_reconstruction_artifacts(preprocessing_dir="output/preprocessing"):
+def compute_exact_mask(gene_pixel_channel, n_channels):
+    """
+    Which genes get an exact (lossless) round-trip reconstruction vs. an averaged
+    (lossy) one, for any channel count.
+
+    A gene is exact if it holds a dedicated per-pixel slot (channels 0..n_channels-2),
+    or if it's the only gene sharing the overflow slot (channel n_channels-1) at its
+    pixel — create_multichannel_expression_images_from_tsne only divides by the
+    overflow count when that count is > 1, so a lone overflow occupant is untouched.
+    A gene is lossy only when 2+ genes share the overflow slot at the same pixel —
+    they're then indistinguishable in the reconstructed value (the pixel average).
+
+    For n_channels == 1 every gene is nominally "in the overflow slot" (there's only
+    one channel), so this reduces to: exact == the gene's pixel has no collision,
+    lossy == it does — i.e. the same singleton/collision split as
+    evaluation.pixel_collision_analysis.count_genes_per_pixel.
+
+    Args:
+        gene_pixel_channel: (N_genes, 3) int32 — [px, py, ch] per gene
+        n_channels: number of channels the config was built with
+
+    Returns:
+        exact_mask: (N_genes,) bool — True where reconstruction is exact
+    """
+    ch = gene_pixel_channel[:, 2]
+    overflow_ch = n_channels - 1
+    in_overflow = ch == overflow_ch
+
+    exact_mask = np.ones(len(gene_pixel_channel), dtype=bool)
+    if np.any(in_overflow):
+        pxpy = gene_pixel_channel[in_overflow][:, :2]
+        _, inverse, counts = np.unique(pxpy, axis=0, return_inverse=True, return_counts=True)
+        shared = counts[inverse] > 1
+        exact_mask[in_overflow] = ~shared
+    return exact_mask
+
+
+def load_reconstruction_artifacts(preprocessing_dir=DEFAULT_CONFIG.artifact_dir):
     """Load the artifacts needed for reverse mapping.
 
     Args:
@@ -75,7 +118,7 @@ def load_reconstruction_artifacts(preprocessing_dir="output/preprocessing"):
 if __name__ == "__main__":
     import os
 
-    preprocessing_dir = "output/preprocessing"
+    preprocessing_dir = DEFAULT_CONFIG.artifact_dir
 
     resized_path = os.path.join(preprocessing_dir, "resized_expressions.npy")
     if not os.path.exists(resized_path):
