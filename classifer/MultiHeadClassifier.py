@@ -37,50 +37,15 @@ import os
 
 import numpy as np
 import tensorflow as tf
-from sklearn.model_selection import train_test_split
 from tensorflow.keras import layers
 from tensorflow.keras.optimizers import Adam
 
+from classifer.training_data import ImageBatches, describe_split, donor_of, make_split
 from preprocessing.artifact_paths import PreprocessingConfig, model_output_dir
 from preprocessing.label_frame import load_vocab
 
 DEFAULT_HEADS = ("tissue", "condition", "subtype", "source")
 MODEL_OUTPUT_FILE = "multihead_classifier.keras"
-
-
-class ImageBatches(tf.keras.utils.PyDataset):
-    """Batch generator over a memory-mapped image array.
-
-    resized_expressions.npy is 9.6 GB for this corpus. Loading it and then
-    calling train_test_split copies it, peaking near 19 GB — enough to thrash a
-    16 GB machine. Indexing a memmap per batch keeps resident memory at roughly
-    batch size instead, and costs nothing on a large VM.
-    """
-
-    def __init__(self, images, labels, indices, batch_size, shuffle=False, seed=0, **kw):
-        super().__init__(**kw)
-        self.images = images
-        self.labels = labels
-        self.indices = np.asarray(indices)
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.rng = np.random.default_rng(seed)
-        if shuffle:
-            self.rng.shuffle(self.indices)
-
-    def __len__(self):
-        return int(np.ceil(len(self.indices) / self.batch_size))
-
-    def __getitem__(self, i):
-        # sorted so the memmap is read close to sequentially
-        idx = np.sort(self.indices[i * self.batch_size:(i + 1) * self.batch_size])
-        x = np.asarray(self.images[idx], dtype=np.float32)
-        y = {h: v[idx] for h, v in self.labels.items()}
-        return x, y
-
-    def on_epoch_end(self):
-        if self.shuffle:
-            self.rng.shuffle(self.indices)
 
 
 def build_model(head_sizes, input_shape, learning_rate=1e-4, loss_weights=None):
@@ -107,67 +72,6 @@ def build_model(head_sizes, input_shape, learning_rate=1e-4, loss_weights=None):
         metrics={n: ["accuracy"] for n in head_sizes},
     )
     return model
-
-
-def donor_of(sample_id):
-    """Donor/patient key. GTEX-1117F-0226-... -> GTEX-1117F;
-    TCGA-GU-A42P-01A-... -> TCGA-GU-A42P."""
-    parts = sample_id.split("-")
-    return "-".join(parts[:2]) if sample_id.startswith("GTEX") else "-".join(parts[:3])
-
-
-def make_split(labels, frame, mode="stratified", test_size=0.25, seed=1):
-    """Train/test indices under one of three regimes.
-
-    stratified (default)
-        Stratified on tissue x condition. Some cells are genuinely thin — cervix
-        has 13 normals — so an unstratified split can leave a cell absent from one
-        side entirely, making its per-class accuracy undefined rather than noisy.
-
-    vinas
-        Reproduces Viñas et al.'s procedure for this corpus exactly:
-        np.random.seed(0), shuffle the sample axis, take a positional 75/25 slice.
-        No stratification and no donor grouping — their example_synthetic_data
-        notebook calls the plain split_train_test(), not the patient-leak-aware
-        split_train_test_v2() that also ships in their utils.
-
-        The PROCEDURE matches; the PARTITION cannot. Their shuffle is seeded but
-        permutes an array whose pre-shuffle order comes from os.listdir(), which
-        is arbitrary and machine-dependent. Use this for like-for-like comparison,
-        not to reproduce their exact rows.
-
-    donor
-        Groups by donor so no individual appears on both sides. This is the
-        methodologically honest split and it is NOT what the reference paper did:
-        98% of GTEx samples here share a donor with another sample (488 donors
-        across 2,322 samples), and a random 75/25 split puts ~551 donors on both
-        sides. Report it alongside `vinas`, not instead of it.
-    """
-    n = len(frame)
-    idx = np.arange(n)
-
-    if mode == "vinas":
-        rng = np.random.RandomState(0)
-        shuffled = idx.copy()
-        rng.shuffle(shuffled)
-        cut = int((1.0 - test_size) * n)
-        return shuffled[:cut], shuffled[cut:]
-
-    if mode == "donor":
-        from sklearn.model_selection import GroupShuffleSplit
-        groups = frame["sample_id"].map(donor_of).to_numpy()
-        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
-        tr, te = next(gss.split(idx, groups=groups))
-        return idx[tr], idx[te]
-
-    strat = None
-    if "tissue" in labels and "condition" in labels:
-        joint = (labels["tissue"].argmax(1).astype(np.int64) * 100
-                 + labels["condition"].argmax(1))
-        counts = np.bincount(joint)
-        if counts[counts > 0].min() >= 2:
-            strat = joint
-    return train_test_split(idx, test_size=test_size, random_state=seed, stratify=strat)
 
 
 def report_slices(model, images, labels, val_idx, meta, heads):
@@ -266,12 +170,7 @@ def main():
     print(f"  heads    : {head_sizes}")
 
     train_idx, val_idx = make_split(labels, frame, mode=args.split)
-    donors_tr = set(frame.sample_id.iloc[train_idx].map(donor_of))
-    donors_te = set(frame.sample_id.iloc[val_idx].map(donor_of))
-    print(f"  split    : {len(train_idx)} train / {len(val_idx)} val  (mode={args.split})")
-    print(f"             {len(donors_tr & donors_te)} donors appear on BOTH sides"
-          + ("  <- matches the reference paper, which did not group by donor"
-             if args.split != "donor" else ""))
+    print(describe_split(frame, train_idx, val_idx, args.split))
 
     model = build_model(head_sizes, config.image_shape, args.learning_rate)
     model.summary()

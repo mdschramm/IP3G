@@ -4,7 +4,7 @@ step that costs money or needs something only they can do.
 
 $ARGUMENTS is `[module] [dataset]`, both optional and order-independent enough to be obvious:
 
-- **module**: `gan`, `diffusion` (default), `classifier`, or `fidelity`. For `diffusion`,
+- **module**: `gan`, `diffusion` (default), `classifier`, `classifier-small`, or `fidelity`. For `diffusion`,
   training always uses `--mode diagnostic` (the only remote-capable diffusion config — see
   `diffusion/diffusion_config.py`). `fidelity` is the M3.5 encoding gate, not a training run.
 - **dataset**: `gtex` (default) or `rnaseqdb` — the combined TCGA+GTEx corpus.
@@ -76,6 +76,11 @@ Steps:
      - `rnaseqdb` → `source gcloud_helpers && RUN_DATASET=rnaseqdb run_remote "classifer/MultiHeadClassifier.py --report-slices"`
        (one head per attribute; `--report-slices` prints the TCGA-only and normals-only
        confound controls, which are the numbers actually worth reading)
+   - `classifier-small`: `source gcloud_helpers && RUN_DATASET=<dataset> run_remote "classifer/ClassiferSmall.py --split vinas"`
+     ~464k params against Classifier.py's 122M, and dataset-aware: it reads
+     `y_primary_disease_or_tissue.npy` for gtex and `y_tissue.npy` (15-way) for rnaseqdb.
+     `--split vinas` reproduces the reference paper's procedure; add a second run with
+     `--split donor` when you want the donor-leak-free number alongside it.
    - `fidelity`: the M3.5 encoding gate. CPU-bound and finishes in minutes, so run it in the
      foreground rather than detached:
      `source gcloud_helpers && RUN_DATASET=<dataset> run_remote_fg "evaluation/roundtrip_fidelity.py"`
