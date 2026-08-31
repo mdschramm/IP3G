@@ -9,7 +9,7 @@ import tensorflow as tf
 import numpy as np
 import os
 from preprocessing.filter_utils import filter_classes
-from preprocessing.artifact_paths import DEFAULT_CONFIG
+from preprocessing.artifact_paths import DEFAULT_CONFIG, model_output_dir
 # import imageio
 # import datetime
 
@@ -25,7 +25,7 @@ RUN_MODE = os.environ.get("RUN_MODE", "local")
 EXCLUDED_CLASSES = [6, 24, 25, 31]
 
 PREPROCESSING_DIR = DEFAULT_CONFIG.artifact_dir
-DATA_DIR = f"output/gan/{RUN_MODE}"
+DATA_DIR = model_output_dir("gan")
 GENERATOR_MODEL_FILE = f"{DATA_DIR}/generator.keras"
 DISCRIMINATOR_MODEL_FILE = f"{DATA_DIR}/discriminator.keras"
 Q_NETWORK_MODEL_FILE = f"{DATA_DIR}/q_network.keras"

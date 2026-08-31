@@ -88,6 +88,7 @@ run_remote_preprocess() {
     if [ "${USE_GPU:-false}" = "true" ]; then gpu_flag="--gpus all"; fi
     local name="${CONTAINER_NAME:-ip3g}"
     gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm -d --name $name $gpu_flag \
+        -e RUN_DATASET=${RUN_DATASET:-gtex} \
         -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
         -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
         -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
@@ -106,6 +107,7 @@ run_remote() {
     local name="${CONTAINER_NAME:-ip3g}"
     gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm -d --name $name $gpu_flag \
         -e RUN_MODE=remote \
+        -e RUN_DATASET=${RUN_DATASET:-gtex} \
         -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
         -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
         -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
@@ -114,6 +116,7 @@ run_remote() {
         -v $VM_OUTPUT_BASE/classifier/remote:/app/output/classifier/remote \
         -v $VM_OUTPUT_BASE/diffusion/remote:/app/output/diffusion/remote \
         -v $VM_OUTPUT_BASE/diffusion/diagnostic:/app/output/diffusion/diagnostic \
+        -v $VM_OUTPUT_BASE/evaluation:/app/output/evaluation \
         $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG $script"
 }
 
@@ -128,6 +131,7 @@ run_remote_fg() {
     local name="${CONTAINER_NAME:-ip3g}"
     gcloud compute ssh $INSTANCE_NAME --zone=$GCLOUD_INSTANCE_ZONE --command="sudo docker run --pull=always --rm --name $name $gpu_flag \
         -e RUN_MODE=remote \
+        -e RUN_DATASET=${RUN_DATASET:-gtex} \
         -v $GCLOUD_MOUNT_POINT/GTEX_phenotype:/app/GTEX_phenotype:ro \
         -v $GCLOUD_MOUNT_POINT/gtex_RSEM_Hugo_norm_count:/app/gtex_RSEM_Hugo_norm_count:ro \
         -v $GCLOUD_MOUNT_POINT/gtex_gene_expected_count:/app/gtex_gene_expected_count:ro \
@@ -136,6 +140,7 @@ run_remote_fg() {
         -v $VM_OUTPUT_BASE/classifier/remote:/app/output/classifier/remote \
         -v $VM_OUTPUT_BASE/diffusion/remote:/app/output/diffusion/remote \
         -v $VM_OUTPUT_BASE/diffusion/diagnostic:/app/output/diffusion/diagnostic \
+        -v $VM_OUTPUT_BASE/evaluation:/app/output/evaluation \
         $GCLOUD_ARTIFACTORY_HOST/$GCLOUD_PROJECT_NAME/$GCLOUD_REPO/$GCLOUD_IMAGE:$GCLOUD_TAG $script"
 }
 

@@ -11,3 +11,4 @@ output/
 legacy/
 evaluation/*.csv
 evaluation/explore/*.png
+data/

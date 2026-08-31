@@ -14,11 +14,11 @@ from tensorflow.keras import backend as K
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from preprocessing.filter_utils import filter_classes, EXCLUDED_CLASSES
-from preprocessing.artifact_paths import DEFAULT_CONFIG
+from preprocessing.artifact_paths import DEFAULT_CONFIG, model_output_dir
 
 RUN_MODE = os.environ.get("RUN_MODE", "local")
 PREPROCESSING_DIR = DEFAULT_CONFIG.artifact_dir
-DATA_DIR = f"output/classifier/{RUN_MODE}"
+DATA_DIR = model_output_dir("classifier")
 FEATURE_FILE = "resized_expressions.npy"
 LABEL_FILE = "y_primary_disease_or_tissue.npy"
 

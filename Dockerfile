@@ -52,6 +52,9 @@ COPY evaluation/ /app/evaluation/
 COPY gan/ /app/gan/
 COPY classifer/ /app/classifer/
 COPY diffusion/ /app/diffusion/
+# Pinned third-party metric implementation (Vinas et al.) used by the
+# encoding-fidelity gate and the synthetic-vs-real comparison.
+COPY external/ /app/external/
 
 # Default command; override with `docker run ... <script>`
 ENTRYPOINT ["python", "-u"]

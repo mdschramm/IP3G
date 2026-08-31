@@ -1,0 +1,3 @@
+[submodule "external/adversarial-gene-expression"]
+	path = external/adversarial-gene-expression
+	url = https://github.com/rvinas/adversarial-gene-expression.git

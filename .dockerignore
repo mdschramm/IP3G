@@ -16,6 +16,7 @@ output/
 GTEX_phenotype
 gtex_RSEM_Hugo_norm_count
 gtex_gene_expected_count
+data/
 
 # VCS and editor junk
 .git/
