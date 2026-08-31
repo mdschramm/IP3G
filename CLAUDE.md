@@ -80,7 +80,39 @@ python -m evaluation.gene_reconstruction_analysis --width 256 --height 256 --cha
 `DEFAULT_CONFIG`) visualizes the EDM2 forward-noising process on real preprocessed samples,
 independent of any trained model.
 
-## Running Remotely (A100 on GCP)
+## Factorized Conditioning and Synthetic Evaluation (RNAseqDB)
+
+With `RUN_DATASET=rnaseqdb`, `diffusion_config.get_config()` overlays a factorized
+conditioning spec read from `attribute_vocab.json` — one embedding table per attribute
+(tissue/condition/subtype/source), each with its own null token — and re-reads the corpus's
+measured `sigma_data`. The GTEx flat single-softmax path is untouched and still builds, so the
+existing GTEx checkpoint stays loadable. `class_labels` is `[B]` on the flat path and `[B, A]`
+on the factorized one; the model keeps the same four inputs either way.
+
+```bash
+# bounded local probe — mmap + evenly-spaced gather, so the 9.6GB array is never resident
+RUN_DATASET=rnaseqdb python -m diffusion.diffusion_train --mode local \
+    --max-samples 64 --steps 4 --scratch-dir /tmp/probe
+
+# M5: synthetic vs real, Vinas et al. §5.2 metrics, composition-matched to the test split
+RUN_DATASET=rnaseqdb python -m evaluation.synthetic_fidelity \
+    --checkpoint output/diffusion/local/rnaseqdb/checkpoints/diffusion_model_ema.weights.h5
+```
+
+`evaluation/synthetic_fidelity.py` (M5) reuses `evaluation/vinas_metrics.py` — the same harness
+as the M3.5 gate (`evaluation/roundtrip_fidelity.py`), with synthetic data in place of
+roundtripped real data. It drops M3.5's per-gene sections, which only mean something for paired
+data, and keeps the distributional ones. **M3.5's numbers are M5's ceiling**: the encoding
+already loses 0.072% of genes to pixel collisions before any model is involved, so read an M5
+score against that ceiling rather than against 1.0. Both scripts take the train/test split from
+`classifer/training_data.py:make_split`, so an M5 number and a classifier number refer to the
+same held-out samples.
+
+## Running Remotely (Tesla T4 on GCP)
+
+The VM is `n1-highmem-4` (4 vCPU, 26 GB RAM) with a single **Tesla T4, 15 GB VRAM** — not
+an A100, despite what earlier notes in this file said. Size batch and model memory against
+15 GB.
 
 Source `gcloud_helpers` first — the QUICK REFERENCE block at the top of that file lists the exact commands in order. See `workflows.md` for full step-by-step walkthroughs including first-time VM setup.
 
@@ -90,10 +122,10 @@ Slash commands available in Claude Code: `/deploy`, `/train`, `/logs`, `/sync`, 
 
 - `RUN_MODE` env var: `"local"` (default) or `"remote"` — controls the output subdirectory for **gan** and **classifer**. Diffusion does not read `RUN_MODE`; it selects its config via `diffusion_train.py --mode {local,diagnostic}` instead (`diffusion_config.py: get_config()`).
 - `RUN_DATASET` env var: `"gtex"` (default) or `"rnaseqdb"` — selects the source corpus. Read once in `preprocessing/artifact_paths.py`, so **no entry point takes a `--dataset` flag**; setting the env var re-points both the preprocessing artifacts that get read and the model output directory that gets written. The non-default corpus nests inside the existing directories (`output/preprocessing/rnaseqdb/`, `output/classifier/remote/rnaseqdb/`) so the VM bind-mounts and recursive rsyncs in `gcloud_helpers` pick it up with no changes. `GTEX_DATASET` in that module is a **structural constant, not a default** — it marks which corpus owns the unsuffixed paths and must never be overridden, or a non-GTEx run would resolve to `output/preprocessing/` and overwrite the GTEx artifacts.
-- Output dirs: `output/{module}/{local|remote}/` for gan/classifier; `output/diffusion/{local|diagnostic}/` for diffusion. A `remote` diffusion config existed at one point but was unused/stale and was removed — `diagnostic` (full remote architecture, bounded step count) is what actually runs on the A100.
+- Output dirs: `output/{module}/{local|remote}/` for gan/classifier; `output/diffusion/{local|diagnostic}/` for diffusion. A `remote` diffusion config existed at one point but was unused/stale and was removed — `diagnostic` (full remote architecture, bounded step count) is what actually runs remotely.
 - Preprocessing output: `output/preprocessing/` for the default (128×128×16) config; other configs use tagged subdirectories (see Data Flow above). No local/remote split — shared, read-only input for all downstream modules.
-- Mixed precision: GAN disables it locally and enables it remotely (`RUN_MODE` check in `gan/model.py`). Diffusion deliberately enables it **locally too** (`CONFIG_LOCAL['mixed_precision'] = True` in `diffusion_config.py`) so Metal-specific FP16 issues surface on a cheap local run before they cost A100 hours — this is intentional, not a bug.
-- `jit_compile=False` on GAN compile — disables XLA JIT; required on both Metal and A100. Enabling it under mixed_float16 on A100 causes mode collapse at ~epoch 663 (XLA op fusion changes float16 numerical trajectory).
+- Mixed precision: GAN disables it locally and enables it remotely (`RUN_MODE` check in `gan/model.py`). Diffusion deliberately enables it **locally too** (`CONFIG_LOCAL['mixed_precision'] = True` in `diffusion_config.py`) so Metal-specific FP16 issues surface on a cheap local run before they cost VM GPU hours — this is intentional, not a bug.
+- `jit_compile=False` on GAN compile — disables XLA JIT; required on both Metal and the T4. Enabling it under mixed_float16 on the remote GPU causes mode collapse at ~epoch 663 (XLA op fusion changes float16 numerical trajectory).
 
 ### Local memory feasibility
 

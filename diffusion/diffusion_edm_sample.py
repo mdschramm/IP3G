@@ -196,6 +196,61 @@ def load_model(config, checkpoint_path):
     return model
 
 
+def generate_conditioned_batch(model, config, class_labels, guidance_scale=3.0,
+                               num_steps=40, batch_size=32, occupancy_mask=None,
+                               uncond_labels=None, verbose=True):
+    """Generate one image per row of `class_labels`, in chunks.
+
+    generate_dataset_edm enumerates classes and makes N of each. This instead
+    takes an explicit label array, which is what a distribution comparison needs:
+    to ask whether synthetic data matches real data, the synthetic set must carry
+    the SAME label composition as the real set being compared against. Generating
+    a flat N-per-class set instead would change the tissue mix, and the gamma
+    metrics would then be measuring that composition shift rather than sample
+    quality.
+
+    Works for both conditioning schemes — class_labels is [N] on the flat path
+    and [N, A] on the factorized one.
+
+    Returns:
+        float32 [N, H, W, C] in [0, 1].
+    """
+    labels = np.asarray(class_labels, dtype=np.int32)
+    attribute_sizes = config.get('attributes')
+    null_tokens = [v for _, v in attribute_sizes] if attribute_sizes else None
+
+    if occupancy_mask is None:
+        mask_path = os.path.join(config['data_dir'], 'pixel_occupancy_mask.npy')
+        if os.path.exists(mask_path):
+            occupancy_mask = tf.constant(np.load(mask_path).astype(np.float32))
+
+    sigmas = diffusion_utils.edm_sigma_schedule(
+        sigma_max=config['sigma_max'], sigma_min=config['sigma_min'],
+        num_steps=num_steps, rho=config.get('sigma_rho', 7),
+    )
+
+    out = np.empty((len(labels), config['image_size'], config['image_size'],
+                    config['in_channels']), dtype=np.float32)
+    for i in range(0, len(labels), batch_size):
+        sl = slice(i, min(i + batch_size, len(labels)))
+        out[sl] = sample_edm_batch(
+            model,
+            class_labels=labels[sl],
+            num_classes=config['num_classes'],
+            null_tokens=null_tokens,
+            uncond_labels=(None if uncond_labels is None
+                           else np.asarray(uncond_labels, dtype=np.int32)[sl]),
+            sigmas=sigmas,
+            sigma_data=config['sigma_data'],
+            guidance_scale=guidance_scale,
+            image_size=config['image_size'],
+            occupancy_mask=occupancy_mask,
+        )
+        if verbose:
+            print(f"    generated {sl.stop}/{len(labels)}", flush=True)
+    return out
+
+
 def generate_dataset_edm(model, config, samples_per_class=100, guidance_scale=3.0,
                           num_steps=40, output_dir=None, classes_per_batch=1):
     """Generate a synthetic dataset for all classes using the EDM ODE sampler.
