@@ -318,12 +318,12 @@ Examples:
       --checkpoint output/diffusion/diagnostic/checkpoints/diffusion_model_final.weights.h5 \\
       --generate-dataset --samples-per-class 100 --guidance-scale 3.0
 
-  python -m diffusion.diffusion_edm_sample --mode remote \\
-      --checkpoint output/diffusion/remote/checkpoints/diffusion_model_ema.weights.h5 \\
+  python -m diffusion.diffusion_edm_sample --mode local \\
+      --checkpoint output/diffusion/local/checkpoints/diffusion_model_final.weights.h5 \\
       --generate-dataset --guidance-scale 5.0 --num-steps 40
         """,
     )
-    parser.add_argument('--mode', type=str, choices=['local', 'remote', 'diagnostic'],
+    parser.add_argument('--mode', type=str, choices=['local', 'diagnostic'],
                         default='diagnostic', help='Config mode (default: diagnostic)')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model weights (.weights.h5)')

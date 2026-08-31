@@ -4,7 +4,7 @@ The user must specify a module as $ARGUMENTS: `gan`, `diffusion`, or `classifier
 
 Default training scripts:
 - `gan`: `gan/model.py --train --refresh`
-- `diffusion`: `diffusion/diffusion_train.py --mode remote`
+- `diffusion`: `diffusion/diffusion_train.py --mode diagnostic` (the only remote-capable diffusion config — `--mode remote` was removed as stale/unused)
 - `classifier`: `classifer/Classifier.py`
 
 Steps:

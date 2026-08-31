@@ -7,9 +7,10 @@
 | Preprocessing | `output/preprocessing/` | `output/preprocessing/` (shared) |
 | GAN | `output/gan/local/` | `output/gan/remote/` |
 | Classifier | `output/classifier/local/` | `output/classifier/remote/` |
-| Diffusion | `output/diffusion/local/` | `output/diffusion/remote/` |
+| Diffusion | `output/diffusion/local/` | `output/diffusion/diagnostic/` |
 
 Preprocessing has no local/remote split — it is run once (remotely) and treated as read-only input by all downstream modules.
+Diffusion has no `remote` config — `diagnostic` (full remote architecture, 30k steps) is what actually runs on the A100; a separate `remote` config existed at one point but was unused/stale and has been removed.
 
 ---
 
@@ -106,7 +107,7 @@ push_output_to_gcs classifier
 ### Step 4 — Diffusion training
 
 ```bash
-run_remote "diffusion/diffusion_train.py --mode remote"
+run_remote "diffusion/diffusion_train.py --mode diagnostic"
 tail_logs
 push_output_to_gcs diffusion
 ```
@@ -143,7 +144,7 @@ tail_logs
 push_output_to_gcs classifier
 
 # Diffusion
-run_remote "diffusion/diffusion_train.py --mode remote"
+run_remote "diffusion/diffusion_train.py --mode diagnostic"
 tail_logs
 push_output_to_gcs diffusion
 
@@ -155,7 +156,7 @@ download_output_from_gcs
 ```bash
 push_gcloud_image_fast
 pull_preprocessing_from_gcs
-run_remote "diffusion/diffusion_train.py --mode remote"
+run_remote "diffusion/diffusion_train.py --mode diagnostic"
 tail_logs
 push_output_to_gcs diffusion
 download_output_from_gcs

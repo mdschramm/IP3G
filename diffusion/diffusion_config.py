@@ -65,66 +65,9 @@ CONFIG_LOCAL = {
     'sample_dir': 'output/diffusion/local/samples',
 }
 
-# Remote configuration - NVIDIA GPU
-CONFIG_REMOTE = {
-    # Model architecture
-    'image_size': DEFAULT_CONFIG.width,
-    'in_channels': DEFAULT_CONFIG.channels,
-    'channels': [32, 64, 128, 256],      # 4 levels: 128→64→32→16 (bottleneck at 16×16)
-    'num_res_blocks': 3,
-    'attention_resolutions': [16],        # Attention at 16×16 bottleneck resolution
-    'num_heads': 4,
-    'dropout': 0.1,
-    'embedding_dim': 256,
-    'num_classes': 54,
-    'excluded_classes': [6, 24, 25, 31],
-    'use_sparse_attention': False,
-    'sparse_top_k_frac': 0.5,
-    'res_balance': 0.3,
-
-    # Training
-    'batch_size': 128,
-    'learning_rate': 5e-5,
-    'lr_schedule': 'cosine',
-    'num_steps': 500_000,
-    'save_interval': 10_000,
-    'sample_interval': 5_000,
-    'log_interval': 250,
-    'diag_interval': 999_999,            # Disabled for remote — too costly
-    'ema_decay': 0.9999,
-    'gradient_clip': 1.0,
-    'warmup_steps': 25_000,
-    'mixed_precision': True,
-
-    # EDM2 noise parameterization
-    'sigma_data': 0.1709, # (from occupied pixel variance shown in sigma_data.json)
-    'P_mean': -1.77,
-    'P_std': 1.2,
-    'sigma_min': 0.002,
-    'sigma_max': 80.0,
-    'sigma_rho': 7,
-
-    # Classifier-free guidance
-    'dropout_rate': 0.10,
-
-    # FP16 safety
-    'act_clip_magnitude': 256.0,
-
-    # Logvar MLP
-    'logvar_channels': 128,
-
-    # Data
-    'data_dir': DEFAULT_CONFIG.artifact_dir,
-    'feature_file': 'resized_expressions.npy',
-    'label_file': 'y_primary_disease_or_tissue.npy',
-    'checkpoint_dir': 'output/diffusion/remote/checkpoints',
-    'sample_dir': 'output/diffusion/remote/samples',
-}
-
-
-# Diagnostic configuration — full remote architecture, 30k steps
-# Intent: run remotely to validate model behaviour (loss shape, CFG separation,
-# gradient norms) before committing to a full 500k-step run.
+# Diagnostic configuration — the actual config used for remote (A100) runs.
+# Intent: validate model behaviour (loss shape, CFG separation, gradient norms)
+# on the full-size architecture without committing to an unbounded run.
 CONFIG_DIAGNOSTIC = {
     # Architecture — identical to remote so results are representative
     'image_size': DEFAULT_CONFIG.width,
@@ -185,16 +128,14 @@ def get_config(mode='local'):
     """Return configuration dict for the specified training mode.
 
     Args:
-        mode: 'local' (Mac M2), 'remote' (16GB GPU), or 'diagnostic' (30k-step remote arch same as remote)
+        mode: 'local' (Mac, sanity checks) or 'diagnostic' (A100, actual remote runs)
     """
     if mode == 'local':
         return CONFIG_LOCAL.copy()
-    elif mode == 'remote':
-        return CONFIG_REMOTE.copy()
     elif mode == 'diagnostic':
         return CONFIG_DIAGNOSTIC.copy()
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use 'local', 'remote', or 'diagnostic'.")
+        raise ValueError(f"Unknown mode: {mode}. Use 'local' or 'diagnostic'.")
 
 
 def print_config(config):
@@ -240,7 +181,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description='View diffusion model configurations')
-    parser.add_argument('--mode', type=str, choices=['local', 'remote', 'diagnostic'], default='local',
+    parser.add_argument('--mode', type=str, choices=['local', 'diagnostic'], default='local',
                         help='Configuration mode to display')
     args = parser.parse_args()
 

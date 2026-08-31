@@ -271,17 +271,21 @@ Reference: Zhai et al. 2022, "Scaling ViT to 22B Parameters."
 
 *Source: `diffusion_train.py`*
 
-| Hyperparameter | Remote config | Local config |
+| Hyperparameter | Diagnostic config (remote, A100) | Local config (Mac) |
 |---|---|---|
-| Steps | 500,000 | 1,000 |
-| Batch size | 128 | 8 |
+| Steps | 30,000 | 1,000 |
+| Batch size | 32 | 8 |
 | Optimizer | AdamW(β₁=0.9, β₂=0.99, wd=0.01, clipnorm=1.0) | same |
-| LR schedule | warmup(25k) + cosine decay | warmup(50) + flat |
-| Base LR | 5e-5 | 3e-4 |
-| EMA decay | 0.9999 | 0.99 |
-| Mixed precision | FP16 + LossScaleOptimizer | disabled (Metal) |
+| LR schedule | warmup(1.5k) + cosine decay | warmup(50) + flat |
+| Base LR | 3e-4 | 3e-4 |
+| EMA decay | 0.9995 | 0.99 |
+| Mixed precision | FP16 + LossScaleOptimizer | FP16 + LossScaleOptimizer — deliberately kept on (not disabled) so Metal-specific FP16 issues surface locally before they cost A100 hours |
 | CFG dropout | 10% | 10% |
 | Excluded classes | [6, 24, 25, 31] (< 10 samples) | same |
+
+There is no separate "remote" config — `diagnostic` (full remote architecture, bounded step count) is what actually
+runs on the A100; a `CONFIG_REMOTE` with an open-ended 500k-step schedule existed at one point but was unused/stale
+and has been removed from `diffusion_config.py`.
 
 **EMA** shadow weights are maintained in float32. The update `(1 − decay) ≈ 1e-4`
 underflows in FP16, which would cause the shadow to never move. EMA weights are

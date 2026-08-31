@@ -545,8 +545,10 @@ def train(config, resume_from=None):
     print("\n📊 Loading data...")
     data_dir = config['data_dir']
     # Cast features to float32 up-front: halves dataset memory vs. native float64
-    # and matches the model's compute dtype.
-    X_train = np.load(os.path.join(data_dir, config['feature_file'])).astype(np.float32)
+    # and matches the model's compute dtype. copy=False avoids doubling memory
+    # (to ~16GB transient) when the array is already float32 on disk, as
+    # resized_expressions.npy currently is.
+    X_train = np.load(os.path.join(data_dir, config['feature_file'])).astype(np.float32, copy=False)
     y_train = np.load(os.path.join(data_dir, config['label_file'])).astype(np.float32)
     
     print(f"  Features: {X_train.shape}")
@@ -863,12 +865,12 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Train locally (Mac M2)
+  # Local sanity check (Mac)
   python diffusion_train.py --mode local
-  
+
   # Train on remote (A100)
-  python diffusion_train.py --mode remote
-  
+  python diffusion_train.py --mode diagnostic
+
   # Resume from checkpoint
   python diffusion_train.py --mode local --resume output/diffusion/local/checkpoints/diffusion_model_step_010000.weights.h5
         """
@@ -876,9 +878,9 @@ Examples:
     parser.add_argument(
         '--mode',
         type=str,
-        choices=['local', 'remote', 'diagnostic'],
+        choices=['local', 'diagnostic'],
         default='local',
-        help='Training mode: local (Mac M2), remote (A100), or diagnostic (1000-step remote architecture)'
+        help='Training mode: local (Mac, sanity checks) or diagnostic (A100, actual remote runs)'
     )
     parser.add_argument(
         '--resume',
