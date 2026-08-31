@@ -409,6 +409,44 @@ def _save_diag_history(history, path):
     np.savez(path, **flat)
 
 
+def load_factorized_labels(data_dir, attribute_sizes):
+    """Stack per-attribute one-hots into one [N, A] int32 code array.
+
+    Preprocessing writes one y_<attr>.npy one-hot per attribute; the model wants
+    a single integer per attribute so it can index that attribute's embedding
+    table. The COLUMN ORDER here must match config['attributes'], because the
+    model slices column a into table a — a silent permutation would train every
+    table against the wrong vocabulary.
+    """
+    codes = []
+    for name, vocab_size in attribute_sizes:
+        path = os.path.join(data_dir, f'y_{name}.npy')
+        one_hot = np.load(path)
+        if one_hot.shape[1] != vocab_size:
+            raise ValueError(
+                f"{path} has {one_hot.shape[1]} columns but config declares "
+                f"{vocab_size} for '{name}'. The vocab and the arrays are out of sync."
+            )
+        codes.append(one_hot.argmax(axis=1).astype(np.int32))
+    return np.stack(codes, axis=1)
+
+
+def factorized_monitoring_labels(attribute_sizes, num_samples):
+    """Sweep the FIRST attribute (tissue), null every other one.
+
+    Monitoring samples exist to show whether conditioning is being used at all.
+    Sweeping one attribute while nulling the rest makes that visible directly:
+    if the grid rows differ, the tissue table has learned something; if they are
+    interchangeable, it has not. Holding the others at real codes instead would
+    confound the two.
+    """
+    labels = np.empty((num_samples, len(attribute_sizes)), dtype=np.int32)
+    for a, (_, vocab_size) in enumerate(attribute_sizes):
+        labels[:, a] = vocab_size          # null token
+    labels[:, 0] = np.arange(num_samples) % attribute_sizes[0][1]
+    return labels
+
+
 def generate_samples(model, config, num_samples=16, guidance_scale=3.0):
     """Generate monitoring samples via the EDM Heun ODE sampler from pure noise.
 
@@ -422,7 +460,13 @@ def generate_samples(model, config, num_samples=16, guidance_scale=3.0):
         num_steps=20,
         rho=config.get('sigma_rho', 7),
     )
-    class_labels = (np.arange(num_samples) % config['num_classes']).astype(np.int32)
+    attribute_sizes = config.get('attributes')
+    if attribute_sizes:
+        class_labels = factorized_monitoring_labels(attribute_sizes, num_samples)
+        null_tokens = [v for _, v in attribute_sizes]
+    else:
+        class_labels = (np.arange(num_samples) % config['num_classes']).astype(np.int32)
+        null_tokens = None
 
     # Load occupancy mask for structurally-aware sampling
     mask_path = os.path.join(config['data_dir'], 'pixel_occupancy_mask.npy')
@@ -434,6 +478,7 @@ def generate_samples(model, config, num_samples=16, guidance_scale=3.0):
         model,
         class_labels=class_labels,
         num_classes=config['num_classes'],
+        null_tokens=null_tokens,
         sigmas=sigmas,
         sigma_data=config['sigma_data'],
         guidance_scale=guidance_scale,
@@ -548,9 +593,32 @@ def train(config, resume_from=None):
     # and matches the model's compute dtype. copy=False avoids doubling memory
     # (to ~16GB transient) when the array is already float32 on disk, as
     # resized_expressions.npy currently is.
-    X_train = np.load(os.path.join(data_dir, config['feature_file'])).astype(np.float32, copy=False)
-    y_train = np.load(os.path.join(data_dir, config['label_file'])).astype(np.float32)
-    
+    feature_path = os.path.join(data_dir, config['feature_file'])
+    attribute_sizes = config.get('attributes')
+
+    max_samples = config.get('max_samples')
+    if max_samples:
+        # Bounded probe: mmap and gather an evenly-spaced subset so the full
+        # 9.6 GB array is never resident. Evenly spaced rather than a head slice
+        # because labels.csv is grouped by tissue — X_train[:64] would be one
+        # tissue and would not exercise conditioning at all.
+        mm = np.load(feature_path, mmap_mode='r')
+        n_total = len(mm)
+        take = np.linspace(0, n_total - 1, min(max_samples, n_total)).astype(np.int64)
+        X_train = np.asarray(mm[take], dtype=np.float32)
+        del mm
+    else:
+        take = None
+        X_train = np.load(feature_path).astype(np.float32, copy=False)
+
+    if attribute_sizes:
+        y_train = load_factorized_labels(data_dir, attribute_sizes)
+    else:
+        y_train = np.load(os.path.join(data_dir, config['label_file'])).astype(np.float32)
+    if take is not None:
+        y_train = y_train[take]
+        print(f"  BOUNDED PROBE: {len(take)} of {n_total} samples, evenly spaced")
+
     print(f"  Features: {X_train.shape}")
     print(f"  Labels: {y_train.shape}")
 
@@ -588,9 +656,11 @@ def train(config, resume_from=None):
         sigma_min=config.get('sigma_min', 0.002),
         sigma_max=config.get('sigma_max', 80.0),
         sigma_data=float(config.get('sigma_data', 0.139)),
+        attribute_vocab_sizes=([v for _, v in attribute_sizes] if attribute_sizes else None),
     )
     print(f"  Batch size: {config['batch_size']}")
-    print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%")
+    print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%"
+          f"{' per attribute, independently' if attribute_sizes else ''}")
     print(f"  EDM σ sampling: P_mean={config.get('P_mean')}  P_std={config.get('P_std')}  σ∈[{config.get('sigma_min')}, {config.get('sigma_max')}]")
     if config.get('excluded_classes'):
         print(f"  Excluded classes: {config['excluded_classes']}")
@@ -888,11 +958,38 @@ Examples:
         default=None,
         help='Path to checkpoint to resume from'
     )
-    
+    parser.add_argument(
+        '--max-samples',
+        type=int,
+        default=None,
+        help='Cap the training set (evenly spaced). For bounded sanity probes only: '
+             'avoids loading the full feature array into RAM.'
+    )
+    parser.add_argument(
+        '--steps',
+        type=int,
+        default=None,
+        help='Override num_steps. For bounded sanity probes.'
+    )
+    parser.add_argument(
+        '--scratch-dir',
+        type=str,
+        default=None,
+        help='Redirect checkpoint_dir and sample_dir here, so a probe never writes '
+             'into a real run output directory.'
+    )
+
     args = parser.parse_args()
-    
+
     # Get configuration
     config = get_config(args.mode)
+    if args.max_samples:
+        config['max_samples'] = args.max_samples
+    if args.steps:
+        config['num_steps'] = args.steps
+    if args.scratch_dir:
+        config['checkpoint_dir'] = os.path.join(args.scratch_dir, 'checkpoints')
+        config['sample_dir'] = os.path.join(args.scratch_dir, 'samples')
     
     # Train
     train(config, resume_from=args.resume)

@@ -104,7 +104,8 @@ def edm_sigma_schedule(sigma_max=80.0, sigma_min=0.002, num_steps=40, rho=7):
 
 def prepare_batch_conditional_edm(X, y, num_classes, dropout_rate=0.15,
                                    P_mean=-2.0, P_std=1.2,
-                                   sigma_min=0.002, sigma_max=80.0, sigma_data=0.139):
+                                   sigma_min=0.002, sigma_max=80.0, sigma_data=0.139,
+                                   attribute_vocab_sizes=None):
     """EDM2 training batch with preconditioning applied in the dataset.
 
     Samples σ from log-normal, forward-diffuses x0, applies c_in/c_skip/c_out
@@ -146,8 +147,14 @@ def prepare_batch_conditional_edm(X, y, num_classes, dropout_rate=0.15,
     x_in   = c_in_b * x_t                      # scaled model input
     target = (X - c_skip_b * x_t) / c_out_b    # unit-weight target for F
 
-    class_labels = tf.argmax(y, axis=-1, output_type=tf.int32)
-    class_labels = apply_classifier_free_dropout(class_labels, num_classes, dropout_rate)
+    if attribute_vocab_sizes is None:
+        class_labels = tf.argmax(y, axis=-1, output_type=tf.int32)
+        class_labels = apply_classifier_free_dropout(class_labels, num_classes, dropout_rate)
+    else:
+        # Factorized: y already arrives as [B, A] integer codes, not a one-hot.
+        class_labels = tf.cast(y, tf.int32)
+        class_labels = apply_factorized_dropout(
+            class_labels, attribute_vocab_sizes, dropout_rate)
 
     return {
         'X_noisy':      x_in,
@@ -160,7 +167,7 @@ def prepare_batch_conditional_edm(X, y, num_classes, dropout_rate=0.15,
 def prepare_dataset_conditional_edm(X, y, num_classes, batch_size=32, dropout_rate=0.15,
                                      shuffle=True, drop_remainder=False, excluded_classes=None,
                                      P_mean=-2.0, P_std=1.2, sigma_min=0.002, sigma_max=80.0,
-                                     sigma_data=0.139):
+                                     sigma_data=0.139, attribute_vocab_sizes=None):
     """Create tf.data.Dataset for EDM2 conditional training."""
     if excluded_classes:
         class_indices = np.argmax(y, axis=-1)
@@ -179,6 +186,7 @@ def prepare_dataset_conditional_edm(X, y, num_classes, batch_size=32, dropout_ra
         return prepare_batch_conditional_edm(
             x, lbl, num_classes, dropout_rate,
             P_mean, P_std, sigma_min, sigma_max, sigma_data,
+            attribute_vocab_sizes,
         )
 
     return ds.batch(batch_size, drop_remainder=drop_remainder).map(
@@ -202,6 +210,37 @@ def apply_classifier_free_dropout(class_labels, num_classes, dropout_rate=0.15):
     mask = tf.random.uniform([batch_size]) < dropout_rate
     unconditional_token = tf.constant(num_classes, dtype=class_labels.dtype)
     return tf.where(mask, unconditional_token, class_labels)
+
+
+def apply_factorized_dropout(class_labels, attribute_vocab_sizes, dropout_rate=0.15):
+    """Per-attribute classifier-free dropout.
+
+    Each attribute is dropped INDEPENDENTLY rather than as a row. Dropping the
+    whole row only ever teaches the model the two endpoints — everything known
+    and nothing known — and a per-attribute guidance scale at sampling time
+    would then be querying a combination the model never saw. Independent
+    dropout covers all 2^A masks, so any subset of attributes can be nulled at
+    inference.
+
+    A consequence worth stating: at dropout_rate=0.1 with A=4, a fully
+    unconditional row appears only 0.1^4 = 1 in 10,000 batches-elements. The
+    all-null score used by plain CFG is therefore reached by generalization
+    across masks, not by memorization of that exact row. This is the standard
+    trade in factorized/compositional guidance and is why the rate should not be
+    pushed much below 0.1 here.
+
+    Args:
+        class_labels: int32 [batch_size, num_attributes] of per-attribute codes.
+        attribute_vocab_sizes: list of vocab sizes; null token for attribute a is
+            attribute_vocab_sizes[a] (one past the last real code).
+        dropout_rate: per-attribute probability of replacing with the null token.
+    """
+    batch_size = tf.shape(class_labels)[0]
+    num_attrs = len(attribute_vocab_sizes)
+    null_tokens = tf.constant(list(attribute_vocab_sizes), dtype=class_labels.dtype)
+    null_row = tf.broadcast_to(null_tokens[tf.newaxis, :], [batch_size, num_attrs])
+    mask = tf.random.uniform([batch_size, num_attrs]) < dropout_rate
+    return tf.where(mask, null_row, class_labels)
 
 
 def _round_trip_test(data_path=DEFAULT_CONFIG.resized_expressions_path):

@@ -404,6 +404,77 @@ class TimeAndClassEmbedding(layers.Layer):
         return config
 
 
+class FactorizedConditioning(layers.Layer):
+    """Time embedding plus one embedding table per label attribute.
+
+    WHY A SECOND LAYER INSTEAD OF GENERALIZING TimeAndClassEmbedding
+        The GTEx model is trained and checkpointed against a single 55-row table.
+        Reshaping that layer would invalidate those weights for no gain, so the
+        flat and factorized paths live side by side exactly as Classifier.py and
+        MultiHeadClassifier.py do; build_unet picks one from the config.
+
+    WHY ONE TABLE PER ATTRIBUTE INSTEAD OF ONE PER COMBINATION
+        The cross product here is 15 x 2 x 20 x 2 = 1,200 classes over 9,147
+        samples, and most cells are empty (there is no tumor salivary code, no
+        normal-only subtype). A flat table would give those cells no training
+        signal at all. Factorized tables share statistical strength: "tumor" is
+        learned from all 3,743 tumors regardless of site.
+
+    WHY EACH TABLE CARRIES ITS OWN NULL TOKEN (index = vocab size)
+        Guidance becomes per-attribute. Nulling every attribute gives the plain
+        unconditional score; nulling all but one isolates that attribute's
+        direction, so a sample can be pushed toward "tumor" without also being
+        pushed toward the tissue that dominates the tumor set.
+
+    Attribute embeddings are AVERAGED, not summed: the sum of A unit-scale
+    embeddings grows like sqrt(A), which would silently rescale the conditioning
+    signal relative to the flat path and invalidate its tuned res_balance and
+    learning rate. The averaging constant is absorbable by the tables during
+    training; the initialization scale is what matters.
+    """
+
+    def __init__(self, attribute_sizes, embedding_dim, **kwargs):
+        super().__init__(**kwargs)
+        # Ordered: column a of class_labels indexes table a. The order comes from
+        # the config and must match the order the dataset stacks codes in.
+        self.attribute_sizes = [(str(n), int(v)) for n, v in attribute_sizes]
+        self.embedding_dim = embedding_dim
+
+    def build(self, input_shape):
+        self.attribute_embeddings = [
+            layers.Embedding(vocab + 1, self.embedding_dim, name=f'emb_{name}')
+            for name, vocab in self.attribute_sizes
+        ]
+        self.time_mlp = keras.Sequential([
+            MPLinear(self.embedding_dim * 4),
+            MPSiLU(),
+            MPLinear(self.embedding_dim),
+        ])
+        super().build(input_shape)
+
+    def call(self, inputs):
+        timesteps, class_labels = inputs        # [B], [B, A] int32
+
+        time_emb = get_sinusoidal_embeddings(timesteps, self.embedding_dim)
+        time_emb = self.time_mlp(time_emb)
+
+        attr_emb = None
+        for i, embedding in enumerate(self.attribute_embeddings):
+            e = embedding(class_labels[:, i])   # [B, emb_dim]
+            attr_emb = e if attr_emb is None else attr_emb + e
+        attr_emb = attr_emb / float(len(self.attribute_embeddings))
+
+        return time_emb + attr_emb
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'attribute_sizes': self.attribute_sizes,
+            'embedding_dim': self.embedding_dim,
+        })
+        return config
+
+
 class Downsample(layers.Layer):
     """Downsampling layer using strided convolution."""
     
@@ -621,6 +692,8 @@ def build_unet(config):
     embedding_dim = config['embedding_dim']
     act_clip = float(config.get('act_clip_magnitude', 256.0))
     num_classes = config['num_classes']
+    # Factorized conditioning (M4): [(name, vocab_size), ...]. Absent -> flat path.
+    attribute_sizes = config.get('attributes')
     use_sparse_attention = config.get('use_sparse_attention', False)
     sparse_top_k_frac = config.get('sparse_top_k_frac', 0.5)
     
@@ -629,12 +702,23 @@ def build_unet(config):
     # Inputs — t_input is float32: receives c_noise = ln(σ)/4 (continuous EDM2 conditioning)
     x_input    = layers.Input(shape=(image_size, image_size, in_channels), name='x_noisy')
     t_input    = layers.Input(shape=(), dtype=tf.float32, name='timesteps')
-    c_input    = layers.Input(shape=(), dtype=tf.int32, name='class_labels')
+    # class_labels is [B] of class indices on the flat path and [B, A] of
+    # per-attribute codes on the factorized one. Keeping the SAME four model
+    # inputs either way means train_step, the diagnostic probes and the sampler
+    # need no signature change — only the array they pass in gets a second axis.
+    if attribute_sizes:
+        c_input = layers.Input(shape=(len(attribute_sizes),), dtype=tf.int32,
+                               name='class_labels')
+    else:
+        c_input = layers.Input(shape=(), dtype=tf.int32, name='class_labels')
     mask_input = layers.Input(shape=(image_size, image_size, in_channels),
                               dtype=tf.float32, name='occupancy_mask')
 
     # Embeddings
-    embedding_layer = TimeAndClassEmbedding(num_classes, embedding_dim)
+    if attribute_sizes:
+        embedding_layer = FactorizedConditioning(attribute_sizes, embedding_dim)
+    else:
+        embedding_layer = TimeAndClassEmbedding(num_classes, embedding_dim)
     conditioning = embedding_layer([t_input, c_input])
 
     # Initial convolution + soft mask conditioning

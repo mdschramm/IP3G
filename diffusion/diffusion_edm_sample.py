@@ -72,7 +72,8 @@ def _denoise(model, x, sigma, cond_labels, uncond_labels, guidance_scale, sigma_
 
 
 def sample_edm_batch(model, class_labels, num_classes, sigmas, sigma_data=0.139,
-                     guidance_scale=3.0, image_size=128, occupancy_mask=None):
+                     guidance_scale=3.0, image_size=128, occupancy_mask=None,
+                     null_tokens=None, uncond_labels=None):
     """Generate a batch of images via the EDM 2nd-order Heun ODE sampler.
 
     Starts from pure Gaussian noise x ~ N(0, sigma_max²·I) masked to occupied
@@ -89,6 +90,15 @@ def sample_edm_batch(model, class_labels, num_classes, sigmas, sigma_data=0.139,
         image_size: spatial resolution H=W.
         occupancy_mask: (H, W, C) float32 tensor or None. If None a dense all-ones
                         mask is used (backward compatible with single-channel models).
+        null_tokens: FACTORIZED models only — per-attribute null token ids, i.e.
+                     [vocab_size for each attribute]. class_labels is then [N, A]
+                     and the unconditional branch is the all-null row.
+        uncond_labels: the negative side of the guidance pair, overriding the
+                     all-null default. This is what makes guidance per-attribute:
+                     pass a row that nulls ONLY the attribute being guided and
+                     keeps the others at their conditional values, and the
+                     (cond - uncond) difference isolates that one attribute's
+                     direction instead of the whole conditioning vector's.
 
     Returns:
         numpy array, shape [N, H, W, C], values in [0, 1].
@@ -107,8 +117,24 @@ def sample_edm_batch(model, class_labels, num_classes, sigmas, sigma_data=0.139,
     x = tf.random.normal([n, image_size, image_size, in_channels],
                          dtype=tf.float32) * float(sigmas[0]) * mask_batch
 
-    cond_labels   = tf.constant(class_labels, dtype=tf.int32)
-    uncond_labels = tf.fill([n], tf.constant(num_classes, dtype=tf.int32))
+    cond_labels = tf.constant(class_labels, dtype=tf.int32)
+    if uncond_labels is not None:
+        uncond_labels = tf.constant(uncond_labels, dtype=tf.int32)
+    elif cond_labels.shape.rank == 2:
+        if null_tokens is None:
+            raise ValueError(
+                "Factorized class_labels ([N, A]) need null_tokens=[vocab_size per "
+                "attribute] so the unconditional branch can be built."
+            )
+        if len(null_tokens) != cond_labels.shape[1]:
+            raise ValueError(
+                f"null_tokens has {len(null_tokens)} entries but class_labels has "
+                f"{cond_labels.shape[1]} attribute columns."
+            )
+        uncond_labels = tf.broadcast_to(
+            tf.constant(list(null_tokens), dtype=tf.int32)[None, :], tf.shape(cond_labels))
+    else:
+        uncond_labels = tf.fill([n], tf.constant(num_classes, dtype=tf.int32))
 
     for i in range(len(sigmas) - 1):
         sigma      = float(sigmas[i])

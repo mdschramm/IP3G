@@ -7,7 +7,11 @@ sampled from a log-normal, with c_skip/c_out/c_in preconditioning so the loss
 weight w(σ)·c_out²=1 at all noise levels.
 """
 
-from preprocessing.artifact_paths import DEFAULT_CONFIG
+import json
+import math
+import os
+
+from preprocessing.artifact_paths import DEFAULT_CONFIG, GTEX_DATASET
 
 # Local configuration - Mac M2, 16GB RAM (architectural sanity check, ~2-3 hours)
 CONFIG_LOCAL = {
@@ -124,6 +128,63 @@ CONFIG_DIAGNOSTIC = {
 }
 
 
+# Order is load-bearing: column a of class_labels indexes embedding table a, so
+# this tuple defines the contract between the dataset, the model and the sampler.
+#
+# `source` is included deliberately even though it is near-collinear with
+# `condition` (GTEx is 100% normal). Conditioning on it costs one small table and
+# buys the ability to ASK for a TCGA-style normal vs a GTEx-style normal, which is
+# exactly the axis a residual batch effect would live on. If ComBat fully removed
+# the batch effect, guidance along source does nothing and the table decays to
+# noise — an informative null result either way.
+#
+# Note that `subtype` carries a real "none" code AND a null token, and they mean
+# different things: "none" asserts the sample is a normal with no TCGA code, the
+# null token asserts nothing at all about subtype.
+FACTORIZED_ATTRIBUTES = ('tissue', 'condition', 'subtype', 'source')
+
+
+def _factorized_overlay(config):
+    """Rewrite a GTEx config in place for the RNAseqDB corpus.
+
+    Selected by RUN_DATASET, never by a flag — DEFAULT_CONFIG has already
+    re-pointed data_dir at output/preprocessing/rnaseqdb/, so this only has to
+    fix the parts of the config that are corpus-specific: the label contract,
+    the measured sigma_data, and the output directories.
+    """
+    vocab_path = DEFAULT_CONFIG.attribute_vocab_path
+    if not os.path.exists(vocab_path):
+        raise FileNotFoundError(
+            f"RUN_DATASET={DEFAULT_CONFIG.dataset} needs {vocab_path}.\n"
+            "Build it first:  RUN_DATASET=rnaseqdb python -m preprocessing.prepare_rnaseqdb_data"
+        )
+    with open(vocab_path) as fh:
+        vocab = json.load(fh)
+
+    config['attributes'] = [(name, len(vocab[name])) for name in FACTORIZED_ATTRIBUTES]
+    # num_classes is meaningless once conditioning is factorized; keep it as the
+    # tissue count so anything that still reads it degrades sensibly rather than
+    # indexing a 54-class GTEx vocabulary that does not exist here.
+    config['num_classes'] = len(vocab['tissue'])
+    config['label_file'] = None                 # labels come from y_<attr>.npy, stacked
+    config['excluded_classes'] = []             # every RNAseqDB class is retained
+
+    # sigma_data is a MEASURED property of the corpus, not a hyperparameter. Using
+    # the GTEx 0.1709 here would mis-set the entire EDM2 preconditioning schedule.
+    sigma_path = os.path.join(DEFAULT_CONFIG.artifact_dir, 'sigma_data.json')
+    if os.path.exists(sigma_path):
+        with open(sigma_path) as fh:
+            config['sigma_data'] = float(json.load(fh)['occupied'])
+    config['P_mean'] = math.log(config['sigma_data'])
+
+    # Nest under the existing dirs so the GCS mounts and rsyncs pick it up unchanged.
+    for key in ('checkpoint_dir', 'sample_dir'):
+        head, tail = os.path.split(config[key])
+        config[key] = os.path.join(head, DEFAULT_CONFIG.dataset, tail)
+    config['data_dir'] = DEFAULT_CONFIG.artifact_dir
+    return config
+
+
 def get_config(mode='local'):
     """Return configuration dict for the specified training mode.
 
@@ -131,11 +192,15 @@ def get_config(mode='local'):
         mode: 'local' (Mac, sanity checks) or 'diagnostic' (A100, actual remote runs)
     """
     if mode == 'local':
-        return CONFIG_LOCAL.copy()
+        config = CONFIG_LOCAL.copy()
     elif mode == 'diagnostic':
-        return CONFIG_DIAGNOSTIC.copy()
+        config = CONFIG_DIAGNOSTIC.copy()
     else:
         raise ValueError(f"Unknown mode: {mode}. Use 'local' or 'diagnostic'.")
+
+    if DEFAULT_CONFIG.dataset != GTEX_DATASET:
+        config = _factorized_overlay(config)
+    return config
 
 
 def print_config(config):
@@ -150,7 +215,12 @@ def print_config(config):
     print(f"  ResNet blocks per level: {config['num_res_blocks']}")
     print(f"  Attention at resolutions: {config['attention_resolutions']}")
     print(f"  Embedding dimension: {config['embedding_dim']}")
-    print(f"  Number of classes: {config['num_classes']}")
+    if config.get('attributes'):
+        print("  Conditioning: factorized")
+        for name, size in config['attributes']:
+            print(f"    {name:<10} {size:>3} codes + 1 null token")
+    else:
+        print(f"  Number of classes: {config['num_classes']}")
     print(f"  Residual balance: {config.get('res_balance', 0.3)} (skip/residual split)")
 
     print("\n🎯 Training:")
