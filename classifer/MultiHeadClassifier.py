@@ -109,14 +109,57 @@ def build_model(head_sizes, input_shape, learning_rate=1e-4, loss_weights=None):
     return model
 
 
-def stratified_split(labels, heads, test_size=0.25, seed=1):
-    """Split stratified on tissue x condition, not on a single attribute.
+def donor_of(sample_id):
+    """Donor/patient key. GTEX-1117F-0226-... -> GTEX-1117F;
+    TCGA-GU-A42P-01A-... -> TCGA-GU-A42P."""
+    parts = sample_id.split("-")
+    return "-".join(parts[:2]) if sample_id.startswith("GTEX") else "-".join(parts[:3])
 
-    Some cells are genuinely thin — cervix has 13 normals — so an unstratified
-    split can leave a cell entirely absent from one side and make its per-class
-    accuracy undefined rather than merely noisy.
+
+def make_split(labels, frame, mode="stratified", test_size=0.25, seed=1):
+    """Train/test indices under one of three regimes.
+
+    stratified (default)
+        Stratified on tissue x condition. Some cells are genuinely thin — cervix
+        has 13 normals — so an unstratified split can leave a cell absent from one
+        side entirely, making its per-class accuracy undefined rather than noisy.
+
+    vinas
+        Reproduces Viñas et al.'s procedure for this corpus exactly:
+        np.random.seed(0), shuffle the sample axis, take a positional 75/25 slice.
+        No stratification and no donor grouping — their example_synthetic_data
+        notebook calls the plain split_train_test(), not the patient-leak-aware
+        split_train_test_v2() that also ships in their utils.
+
+        The PROCEDURE matches; the PARTITION cannot. Their shuffle is seeded but
+        permutes an array whose pre-shuffle order comes from os.listdir(), which
+        is arbitrary and machine-dependent. Use this for like-for-like comparison,
+        not to reproduce their exact rows.
+
+    donor
+        Groups by donor so no individual appears on both sides. This is the
+        methodologically honest split and it is NOT what the reference paper did:
+        98% of GTEx samples here share a donor with another sample (488 donors
+        across 2,322 samples), and a random 75/25 split puts ~551 donors on both
+        sides. Report it alongside `vinas`, not instead of it.
     """
-    n = len(next(iter(labels.values())))
+    n = len(frame)
+    idx = np.arange(n)
+
+    if mode == "vinas":
+        rng = np.random.RandomState(0)
+        shuffled = idx.copy()
+        rng.shuffle(shuffled)
+        cut = int((1.0 - test_size) * n)
+        return shuffled[:cut], shuffled[cut:]
+
+    if mode == "donor":
+        from sklearn.model_selection import GroupShuffleSplit
+        groups = frame["sample_id"].map(donor_of).to_numpy()
+        gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        tr, te = next(gss.split(idx, groups=groups))
+        return idx[tr], idx[te]
+
     strat = None
     if "tissue" in labels and "condition" in labels:
         joint = (labels["tissue"].argmax(1).astype(np.int64) * 100
@@ -124,8 +167,7 @@ def stratified_split(labels, heads, test_size=0.25, seed=1):
         counts = np.bincount(joint)
         if counts[counts > 0].min() >= 2:
             strat = joint
-    return train_test_split(np.arange(n), test_size=test_size,
-                            random_state=seed, stratify=strat)
+    return train_test_split(idx, test_size=test_size, random_state=seed, stratify=strat)
 
 
 def report_slices(model, images, labels, val_idx, meta, heads):
@@ -174,6 +216,9 @@ def main():
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--height", type=int, default=128)
     p.add_argument("--channels", type=int, default=16)
+    p.add_argument("--split", choices=("stratified", "vinas", "donor"), default="stratified",
+                   help="stratified (default) | vinas (match the reference paper's procedure) "
+                        "| donor (no donor on both sides)")
     p.add_argument("--report-slices", action="store_true",
                    help="print the confound-control slices after training")
     p.add_argument("--max-samples", type=int, default=None,
@@ -220,8 +265,13 @@ def main():
     print(f"  images   : {images.shape}")
     print(f"  heads    : {head_sizes}")
 
-    train_idx, val_idx = stratified_split(labels, heads)
-    print(f"  split    : {len(train_idx)} train / {len(val_idx)} val (stratified on tissue x condition)")
+    train_idx, val_idx = make_split(labels, frame, mode=args.split)
+    donors_tr = set(frame.sample_id.iloc[train_idx].map(donor_of))
+    donors_te = set(frame.sample_id.iloc[val_idx].map(donor_of))
+    print(f"  split    : {len(train_idx)} train / {len(val_idx)} val  (mode={args.split})")
+    print(f"             {len(donors_tr & donors_te)} donors appear on BOTH sides"
+          + ("  <- matches the reference paper, which did not group by donor"
+             if args.split != "donor" else ""))
 
     model = build_model(head_sizes, config.image_shape, args.learning_rate)
     model.summary()
