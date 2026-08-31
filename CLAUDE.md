@@ -114,6 +114,15 @@ and train-step code path instead of a hand-estimated one.
 - The folder name `classifer/` is a typo but is consistent everywhere (imports, Dockerfile, tests). Do not rename.
 - `SparseSelfAttention` in `diffusion/diffusion_model.py` uses multiplicative top-k gating (not bool masking) to avoid a Metal BroadcastTo kernel bug with bool tensors.
 - Keras 3's Functional API rejects raw `tf.*` ops applied directly to a `KerasTensor` placeholder outside a `Layer.call()` (e.g. `tf.cast(mask_input, ...)` at model-definition time) — use `keras.ops.*` instead (e.g. `keras.ops.cast`). This previously blocked `build_unet()` from constructing at any resolution; fixed in `diffusion_model.py`'s occupancy-mask conditioning.
+- The container `ENTRYPOINT` is `python -u -P`. The `-P` (PYTHONSAFEPATH) is load-bearing:
+  every helper in `gcloud_helpers` passes a script *path* (`evaluation/roundtrip_fidelity.py`),
+  and without `-P` Python puts that script's own directory first on `sys.path`, where
+  `evaluation/evaluation.py` shadows the `evaluation` **package** and any
+  `from evaluation import <sibling>` dies with `ImportError: cannot import name ... from
+  'evaluation' (/app/evaluation/evaluation.py)`. Every import in this repo is
+  package-qualified and `PYTHONPATH=/app` resolves them, so nothing needs the script dir on
+  the path. Locally, run modules with `python -m` (as the docs do) and the same shadowing
+  never arises.
 - `VM_OUTPUT_BASE='$HOME/output'` in `gcloud_helpers` uses **single quotes** intentionally — prevents local `$HOME` expansion so `$HOME` resolves to `/home/mschramm` on the VM.
 - Shell state (e.g. `conda activate dataexplr`) does not persist across separate non-interactive tool invocations in some automation contexts (including Claude Code's Bash tool). When commands run each in their own subshell, prefer the explicit interpreter path — `~/miniconda3/envs/dataexplr/bin/python` — over relying on activation.
 

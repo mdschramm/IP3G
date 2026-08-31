@@ -57,5 +57,12 @@ COPY diffusion/ /app/diffusion/
 COPY external/ /app/external/
 
 # Default command; override with `docker run ... <script>`
-ENTRYPOINT ["python", "-u"]
+#
+# -P (PYTHONSAFEPATH) keeps the script's own directory OFF sys.path. Without it,
+# `python evaluation/roundtrip_fidelity.py` puts /app/evaluation first, where the
+# module evaluation/evaluation.py shadows the evaluation PACKAGE and any
+# `from evaluation import <sibling>` fails. Every import in this repo is
+# package-qualified and PYTHONPATH=/app resolves them all, so nothing needs the
+# script directory on the path.
+ENTRYPOINT ["python", "-u", "-P"]
 CMD ["preprocessing/prepare_training_data.py"]
