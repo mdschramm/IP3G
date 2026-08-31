@@ -121,6 +121,49 @@ def get_model(num_classes, input_shape):
     return model
 
 
+def final_report(model, val_ds, y_true_onehot):
+    """AUC and macro-F1 on the validation set, sklearn-style.
+
+    The compiled Keras metrics above cannot produce either column of Viñas et
+    al. §5.2.2. `f1_m` sums TP/FP over the whole batch, and under a one-hot
+    softmax every sample contributes exactly one predicted positive and one true
+    positive — so it is micro-F1, which is arithmetically identical to accuracy
+    and systematically higher than the macro-F1 the paper reports whenever the
+    rare classes are the hard ones. There is no AUC at all.
+
+    The multiclass-vs-binary branch here is copied deliberately from
+    evaluation/vinas_metrics.py:tstr_scores, so a CNN number and an MLP number
+    from that harness mean the same thing and can sit in the same table.
+
+    Args:
+        y_true_onehot: labels in the exact order val_ds yields them.
+    """
+    from sklearn.metrics import f1_score, roc_auc_score
+
+    proba = model.predict(val_ds, verbose=0)
+    y_true = y_true_onehot.argmax(1)
+    pred = proba.argmax(1)
+    n_classes = y_true_onehot.shape[1]
+
+    if n_classes == 2:
+        auc = roc_auc_score(y_true, proba[:, 1])
+    else:
+        # Mean one-vs-rest AUC over the classes actually present. When every class
+        # is present this is exactly roc_auc_score(multi_class="ovr",
+        # average="macro") — sklearn averages these same per-class binary AUCs —
+        # but that call raises outright if a class is missing from y_true, which
+        # turns a capped smoke run into a crash instead of a number.
+        aucs = [roc_auc_score((y_true == c).astype(int), proba[:, c])
+                for c in np.unique(y_true)]
+        auc = float(np.mean(aucs))
+    return {
+        "accuracy": float((pred == y_true).mean()),
+        "auc": float(auc),
+        "f1_macro": float(f1_score(y_true, pred, average="macro")),
+        "f1_weighted": float(f1_score(y_true, pred, average="weighted")),
+    }
+
+
 def train_model(model, train_ds, val_ds, epochs=100, patience=5):
     stop_early = tf.keras.callbacks.EarlyStopping(
         monitor="val_loss", patience=patience, restore_best_weights=True
@@ -129,10 +172,10 @@ def train_model(model, train_ds, val_ds, epochs=100, patience=5):
                      callbacks=[stop_early])
 
 
-def plot_history(hist, out_dir):
+def plot_history(hist, out_dir, suffix=""):
     for keys, ylabel, fname in (
-        (("loss", "val_loss"), "Loss", "classifier_small_loss.png"),
-        (("accuracy", "val_accuracy"), "Accuracy", "classifier_small_accuracy.png"),
+        (("loss", "val_loss"), "Loss", f"classifier_small_loss{suffix}.png"),
+        (("accuracy", "val_accuracy"), "Accuracy", f"classifier_small_accuracy{suffix}.png"),
     ):
         for k in keys:
             plt.plot(hist.epoch, hist.history[k])
@@ -145,7 +188,7 @@ def plot_history(hist, out_dir):
         print(f"  saved {out_dir}/{fname}")
 
 
-def save_model(model, num_classes, input_shape, out_dir):
+def save_model(model, num_classes, input_shape, out_dir, suffix=""):
     """Weights only, via a freshly built model.
 
     In Keras 3 `save(..., include_optimizer=False)` is not a Model.save
@@ -155,7 +198,7 @@ def save_model(model, num_classes, input_shape, out_dir):
     Copying into a model whose optimizer has never stepped leaves no slots to
     write.
     """
-    path = os.path.join(out_dir, MODEL_OUTPUT_FILE.replace(".keras", ".weights.h5"))
+    path = os.path.join(out_dir, MODEL_OUTPUT_FILE.replace(".keras", f"{suffix}.weights.h5"))
     export = get_model(num_classes, input_shape)
     export.set_weights(model.get_weights())
     export.save_weights(path)
@@ -176,28 +219,50 @@ def main():
     p.add_argument("--width", type=int, default=128)
     p.add_argument("--height", type=int, default=128)
     p.add_argument("--channels", type=int, default=16)
+    p.add_argument("--attribute", choices=("tissue", "condition"), default=None,
+                   help="rnaseqdb only: which attribute to classify. Viñas et al. "
+                        "§5.2.2 reports both a 15-way tissue row and a binary "
+                        "cancer/normal row. Default: the corpus's usual label array.")
+    p.add_argument("--synthetic-dir", default=None,
+                   help="train on the synthetic replica in this directory instead of "
+                        "the real training split. Validation ALWAYS stays on real data.")
+    p.add_argument("--runs", type=int, default=1,
+                   help="independent re-inits, reported as mean +/- std (paper uses 5)")
+    p.add_argument("--out-suffix", default=None,
+                   help="tag appended to every output filename so the real-trained and "
+                        "synthetic-trained runs do not overwrite each other")
     p.add_argument("--max-samples", type=int, default=None,
                    help="cap sample count for LOCAL smoke tests only")
     args = p.parse_args()
+    suffix = f"_{args.out_suffix}" if args.out_suffix else ""
 
     config = PreprocessingConfig(args.width, args.height, args.channels, dataset=RUN_DATASET)
     out_dir = model_output_dir("classifier")
     os.makedirs(out_dir, exist_ok=True)
 
-    label_file = LABEL_FILE_BY_DATASET.get(RUN_DATASET)
-    if label_file is None:
-        raise SystemExit(f"No label file mapped for RUN_DATASET={RUN_DATASET!r}; "
-                         f"known: {sorted(LABEL_FILE_BY_DATASET)}")
+    if args.attribute:
+        if RUN_DATASET == GTEX_DATASET:
+            raise SystemExit("--attribute is an rnaseqdb concept: GTEx carries one fused "
+                             "disease-or-tissue array, not a one-hot per attribute.")
+        label_path = config.y_attribute_path(args.attribute)
+    else:
+        label_file = LABEL_FILE_BY_DATASET.get(RUN_DATASET)
+        if label_file is None:
+            raise SystemExit(f"No label file mapped for RUN_DATASET={RUN_DATASET!r}; "
+                             f"known: {sorted(LABEL_FILE_BY_DATASET)}")
+        label_path = os.path.join(config.dataset_dir, label_file)
+    label_basename = os.path.basename(label_path)
 
     print("=" * 70)
-    print(f"SMALL CLASSIFIER — {config.dataset} — {config.tag}")
+    print(f"SMALL CLASSIFIER — {config.dataset} — {config.tag}"
+          f"{' — ' + args.attribute if args.attribute else ''}")
     print("=" * 70)
     print(f"  features : {config.resized_expressions_path}")
-    print(f"  labels   : {os.path.join(config.dataset_dir, label_file)}")
-    print(f"  outputs  : {out_dir}")
+    print(f"  labels   : {label_path}")
+    print(f"  outputs  : {out_dir}  (suffix {suffix!r})")
 
     images = np.load(config.resized_expressions_path, mmap_mode="r")
-    y = np.load(os.path.join(config.dataset_dir, label_file)).astype(np.float32)
+    y = np.load(label_path).astype(np.float32)
 
     # Class exclusion is a GTEx-only concept: those indices name GTEx body sites
     # with too few samples. RNAseqDB keeps every class (empty EXCLUDED_CLASSES).
@@ -225,22 +290,70 @@ def main():
     train_idx, val_idx = make_split({"tissue": y}, frame, mode=args.split)
     print(describe_split(frame, train_idx, val_idx, args.split))
 
-    model = get_model(num_classes, config.image_shape)
-    train_ds = ImageBatches(images, y, train_idx, args.batch_size, shuffle=True)
+    # Sorted so the concatenation of val batches is in a known order: ImageBatches
+    # sorts each batch internally for memmap locality, which would otherwise
+    # permute predictions relative to y[val_idx] and quietly scramble the report.
+    val_idx = np.sort(val_idx)
+    y_val = y[val_idx]
+
+    if args.synthetic_dir:
+        # The replica IS the training split — every row of it is used, and the
+        # validation set stays on real arrays. That asymmetry is the entire point
+        # of TSTR, so it is not configurable.
+        syn_x = np.load(os.path.join(args.synthetic_dir, FEATURE_FILE), mmap_mode="r")
+        syn_y = np.load(os.path.join(args.synthetic_dir, label_basename)).astype(np.float32)
+        if len(syn_x) != len(syn_y):
+            raise SystemExit(f"{args.synthetic_dir}: {len(syn_x)} images but {len(syn_y)} labels")
+        if syn_y.shape[1] != num_classes:
+            raise SystemExit(f"{args.synthetic_dir}: {syn_y.shape[1]} classes, real data has "
+                             f"{num_classes}")
+        if len(syn_x) != len(train_idx):
+            msg = (f"synthetic replica has {len(syn_x)} rows but the '{args.split}' train "
+                   f"split has {len(train_idx)}")
+            if not args.max_samples:
+                raise SystemExit(msg + " — it was built against a different partition.")
+            print(f"  NOTE: {msg} (expected under --max-samples)")
+        train_x, train_y, train_sel = syn_x, syn_y, np.arange(len(syn_y))
+        trained_on = f"synthetic:{args.synthetic_dir}"
+        print(f"  TSTR: training on {len(syn_y)} synthetic rows, validating on "
+              f"{len(val_idx)} REAL rows")
+    else:
+        train_x, train_y, train_sel = images, y, train_idx
+        trained_on = "real"
+
+    train_ds = ImageBatches(train_x, train_y, train_sel, args.batch_size, shuffle=True)
     val_ds = ImageBatches(images, y, val_idx, args.batch_size)
 
-    hist = train_model(model, train_ds, val_ds, args.epochs, args.patience)
-    save_model(model, num_classes, config.image_shape, out_dir)
-    plot_history(hist, out_dir)
+    runs = []
+    for r in range(args.runs):
+        print(f"\n--- run {r + 1}/{args.runs} ---")
+        tf.keras.utils.set_random_seed(r)
+        model = get_model(num_classes, config.image_shape)
+        hist = train_model(model, train_ds, val_ds, args.epochs, args.patience)
+        keras_scores = model.evaluate(val_ds, verbose=0, return_dict=True)
+        report = final_report(model, val_ds, y_val)
+        runs.append({**report, "keras": keras_scores})
+        print("  " + "  ".join(f"{k}={report[k]:.4f}"
+                               for k in ("accuracy", "auc", "f1_macro", "f1_weighted")))
+        if r == 0:  # weights and curves from the first run only; the rest are for the spread
+            save_model(model, num_classes, config.image_shape, out_dir, suffix)
+            plot_history(hist, out_dir, suffix)
 
-    scores = model.evaluate(val_ds, verbose=0, return_dict=True)
-    print("\nValidation:")
-    for k, v in scores.items():
-        print(f"  {k:<14} {v:.4f}")
-    with open(os.path.join(out_dir, "classifier_small_metrics.json"), "w") as fh:
+    keys = ("accuracy", "auc", "f1_macro", "f1_weighted")
+    mean = {k: float(np.mean([r[k] for r in runs])) for k in keys}
+    std = {k: float(np.std([r[k] for r in runs])) for k in keys}
+    print(f"\nValidation over {args.runs} run(s) — real held-out data:")
+    for k in keys:
+        print(f"  {k:<14} {mean[k]:.4f} ± {std[k]:.4f}")
+
+    metrics_path = os.path.join(out_dir, f"classifier_small_metrics{suffix}.json")
+    with open(metrics_path, "w") as fh:
         json.dump({"dataset": config.dataset, "tag": config.tag, "split": args.split,
-                   "num_classes": int(num_classes), "validation": scores}, fh, indent=2)
-    print(f"  saved {out_dir}/classifier_small_metrics.json")
+                   "attribute": args.attribute, "trained_on": trained_on,
+                   "num_classes": int(num_classes), "n_train": int(len(train_sel)),
+                   "n_val": int(len(val_idx)), "n_runs": args.runs,
+                   "mean": mean, "std": std, "runs": runs}, fh, indent=2)
+    print(f"  saved {metrics_path}")
 
 
 if __name__ == "__main__":

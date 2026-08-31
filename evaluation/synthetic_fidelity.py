@@ -59,6 +59,7 @@ from diffusion.diffusion_model import build_unet
 from evaluation import vinas_metrics as vm
 from preprocessing.artifact_paths import PreprocessingConfig
 from preprocessing.gene_vector_reconstruction import reconstruct_gene_vectors
+from preprocessing.label_frame import load_attribute_codes
 
 # Published reference points (Wang-corpus rows, Viñas et al. Table 2)
 VINAS_GAN_S_DIST = 0.920
@@ -68,16 +69,13 @@ VINAS_BOUND_S_DEND = 0.222
 
 
 def load_label_codes(config, attribute_sizes):
-    """[N, A] integer codes in the order the model's embedding tables expect."""
-    codes = []
-    for name, vocab_size in attribute_sizes:
-        one_hot = np.load(config.y_attribute_path(name))
-        if one_hot.shape[1] != vocab_size:
-            raise ValueError(
-                f"y_{name}.npy has {one_hot.shape[1]} columns, config declares {vocab_size}"
-            )
-        codes.append(one_hot.argmax(axis=1).astype(np.int32))
-    return np.stack(codes, axis=1)
+    """[N, A] integer codes in the order the model's embedding tables expect.
+
+    Delegates to the canonical helper so this harness, the trainer, and the
+    replica generator cannot drift into three different column orders — which
+    would be invisible until the numbers were quietly wrong.
+    """
+    return load_attribute_codes(config, attribute_sizes)
 
 
 def decode(images, config, batch=256):

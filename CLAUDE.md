@@ -108,6 +108,53 @@ score against that ceiling rather than against 1.0. Both scripts take the train/
 `classifer/training_data.py:make_split`, so an M5 number and a classifier number refer to the
 same held-out samples.
 
+### M6 — train on synthetic, test on real (Viñas §5.2.2)
+
+`make_split` is the single definition of the train/test boundary, and four call sites now share
+it: `diffusion_train.py --split`, `generate_synthetic_replica.py`, `synthetic_fidelity.py`, and
+`ClassiferSmall.py`. `mode="vinas"` cuts `int(0.75 × 9147) = 6860` train / **2287** test — the
+same test-set size the paper reports. The trainer persists `split_indices.npz` beside
+`norm_constants.json` so the replica generator can *assert* it matches rather than recompute and
+hope; a replica built against a different partition would train the classifier on synthesized
+test samples and report an excellent, meaningless number.
+
+**`--split` is not optional for M6.** A checkpoint trained without it has seen the whole corpus,
+and every TSTR number derived from it is void. It defaults to `none` so the GTEx flat path (no
+`labels.csv`) is unchanged.
+
+```bash
+# 1. train on the 75% train split only  (remote; ~140 epochs over 6,860 samples)
+RUN_DATASET=rnaseqdb python -m diffusion.diffusion_train --mode diagnostic --split vinas
+
+# 2. synthetic replica of that same train split — 7.2 GB, memmap-written, resumable
+RUN_DATASET=rnaseqdb python -m diffusion.generate_synthetic_replica \
+    --checkpoint <ema>.weights.h5 --mode diagnostic --guidance-scale 2.0
+
+# 3. four classifier runs: {tissue,condition} x {real,synthetic}, 5 seeds each
+RUN_DATASET=rnaseqdb python -m classifer.ClassiferSmall --split vinas --attribute tissue \
+    --runs 5 --out-suffix real_tissue
+RUN_DATASET=rnaseqdb python -m classifer.ClassiferSmall --split vinas --attribute tissue \
+    --runs 5 --out-suffix synth_tissue \
+    --synthetic-dir output/diffusion/diagnostic/rnaseqdb/synthetic_w2
+
+# 4. the comparison table
+RUN_DATASET=rnaseqdb python -m evaluation.tstr_report
+```
+
+`--synthetic-dir` swaps the *training* rows only; validation always stays on the real arrays at
+`val_idx`. `ClassiferSmall`'s compiled `f1_m` is a batch-summed micro-F1 — under a one-hot
+softmax that is arithmetically identical to accuracy — so `--runs` reports a separate sklearn
+`final_report()` with macro-F1, weighted-F1 and macro-OvR AUC, matching
+`vinas_metrics.tstr_scores`'s convention so CNN and MLP numbers can sit in the same table.
+
+Three caveats belong on every M6 row and `tstr_report.py` prints them: the `vinas` split does not
+group by donor (571 donors appear on both sides — inherent to reproducing their procedure, which
+used the plain `split_train_test()`, not the patient-aware `split_train_test_v2()` in the same
+utils file); the encoding loses 0.072% of genes before any model is involved, so M3.5's TSTR row
+is the ceiling; and `sigma_data` was measured over the full corpus during preprocessing, so the
+EDM preconditioning constant carries a whiff of test data. `make_split(mode="donor")` exists for
+the leak-free rerun and is deliberately not used here.
+
 ## Running Remotely (Tesla T4 on GCP)
 
 The VM is `n1-highmem-4` (4 vCPU, 26 GB RAM) with a single **Tesla T4, 15 GB VRAM** — not

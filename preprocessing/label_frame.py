@@ -121,3 +121,35 @@ def describe(labels: pd.DataFrame, attributes, vocab: dict[str, list[str]]) -> s
         for value in vocab[attr]:
             lines.append(f"      {value:<18} {counts.get(value, 0):>6}")
     return "\n".join(lines)
+
+
+def load_attribute_codes(config, attribute_sizes) -> np.ndarray:
+    """Stack per-attribute one-hots into one [N, A] int32 code array.
+
+    Preprocessing writes one y_<attr>.npy one-hot per attribute; every consumer of
+    factorized conditioning — the trainer, the sampler, the fidelity harness —
+    wants a single integer per attribute so it can index that attribute's
+    embedding table. This is the one place that conversion lives, because the
+    COLUMN ORDER is a contract: column a indexes embedding table a, and a silent
+    permutation would train every table against the wrong vocabulary without
+    raising anything.
+
+    Reads through `config.y_attribute_path` rather than joining onto a data_dir,
+    because the one-hots are size-independent and live under `dataset_dir` — a
+    non-default geometry puts `artifact_dir` one level deeper, where they aren't.
+
+    Args:
+        config: a PreprocessingConfig.
+        attribute_sizes: ordered [(name, vocab_size), ...], i.e. config['attributes'].
+    """
+    codes = []
+    for name, vocab_size in attribute_sizes:
+        path = config.y_attribute_path(name)
+        one_hot = np.load(path)
+        if one_hot.shape[1] != vocab_size:
+            raise ValueError(
+                f"{path} has {one_hot.shape[1]} columns but the config declares "
+                f"{vocab_size} for '{name}'. The vocab and the arrays are out of sync."
+            )
+        codes.append(one_hot.argmax(axis=1).astype(np.int32))
+    return np.stack(codes, axis=1)

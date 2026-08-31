@@ -4,9 +4,11 @@ step that costs money or needs something only they can do.
 
 $ARGUMENTS is `[module] [dataset]`, both optional and order-independent enough to be obvious:
 
-- **module**: `gan`, `diffusion` (default), `classifier`, `classifier-small`, or `fidelity`. For `diffusion`,
-  training always uses `--mode diagnostic` (the only remote-capable diffusion config — see
-  `diffusion/diffusion_config.py`). `fidelity` is the M3.5 encoding gate, not a training run.
+- **module**: `gan`, `diffusion` (default), `classifier`, `classifier-small`, `fidelity`, or
+  `synthetic`. For `diffusion`, training always uses `--mode diagnostic` (the only
+  remote-capable diffusion config — see `diffusion/diffusion_config.py`). `fidelity` is the
+  M3.5 encoding gate, not a training run. `synthetic` is the M6 train-on-synthetic comparison
+  and is a multi-step sequence, not a single run.
 - **dataset**: `gtex` (default) or `rnaseqdb` — the combined TCGA+GTEx corpus.
 
 Dataset selection is an **environment variable, not a script flag**: export `RUN_DATASET`
@@ -86,6 +88,26 @@ Steps:
      `source gcloud_helpers && RUN_DATASET=<dataset> run_remote_fg "evaluation/roundtrip_fidelity.py"`
      Skip steps 7-8 for this one — there are no training logs to tail; report the gate table
      directly. Results land in `output/evaluation/<dataset>/`.
+   - `synthetic`: the M6 TSTR comparison against Viñas et al. §5.2.2. rnaseqdb only. This is
+     a **sequence**, and every step depends on the one before it — do not start it unless a
+     split-restricted diffusion checkpoint already exists, i.e. a run that was launched with
+     `--split vinas`. A model trained without that flag has seen the test set and every number
+     downstream of it is meaningless.
+
+     1. Train (if not already done), detached, then wait for it:
+        `RUN_DATASET=rnaseqdb run_remote "diffusion/diffusion_train.py --mode diagnostic --split vinas"`
+     2. Pick the guidance scale on a subset — four short foreground runs, ~512 samples each:
+        `RUN_DATASET=rnaseqdb run_remote_fg "evaluation/synthetic_fidelity.py --checkpoint <ema> --mode diagnostic --max-samples 512 --guidance-scale <w>"`
+        for w in 1.0 2.0 3.0 5.0, and take the best gamma S_dist against the M3.5 ceiling.
+     3. Generate the replica at the winning w, detached — this is hours, not minutes:
+        `RUN_DATASET=rnaseqdb run_remote "diffusion/generate_synthetic_replica.py --checkpoint <ema> --mode diagnostic --guidance-scale <w>"`
+        It writes a 7.2 GB array. **Never `/sync` it down**; everything that reads it runs on
+        the VM. It resumes from `progress.json`, so a re-launch after an interruption is safe.
+     4. Four classifier runs, each a few minutes, `--runs 5`:
+        `RUN_DATASET=rnaseqdb run_remote_fg "classifer/ClassiferSmall.py --split vinas --attribute {tissue,condition} --runs 5 --out-suffix {real,synth}_{tissue,condition} [--synthetic-dir output/diffusion/diagnostic/rnaseqdb/synthetic_w<w>]"`
+        The two real-trained runs omit `--synthetic-dir`; the two synthetic-trained runs pass it.
+     5. Report: `RUN_DATASET=rnaseqdb run_remote_fg "evaluation/tstr_report.py"`, then relay the
+        table. `/sync classifier` and `/sync eval` bring the JSONs down (small).
 
    Aside from the classifier's two variants, script paths do not change per dataset — only the
    env var does.

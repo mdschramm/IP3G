@@ -18,10 +18,13 @@ from tensorflow import keras
 import matplotlib.pyplot as plt
 from datetime import datetime
 
+from classifer.training_data import make_split
 from diffusion.diffusion_config import get_config, print_config
 from diffusion.diffusion_model import build_unet
 import diffusion.diffusion_utils as diffusion_utils
+from preprocessing.artifact_paths import DEFAULT_CONFIG, PreprocessingConfig
 from preprocessing.filter_utils import filter_classes
+from preprocessing.label_frame import load_attribute_codes
 
 
 class EMA:
@@ -409,26 +412,16 @@ def _save_diag_history(history, path):
     np.savez(path, **flat)
 
 
-def load_factorized_labels(data_dir, attribute_sizes):
-    """Stack per-attribute one-hots into one [N, A] int32 code array.
+def load_factorized_labels(config, attribute_sizes):
+    """[N, A] int32 codes for the factorized path.
 
-    Preprocessing writes one y_<attr>.npy one-hot per attribute; the model wants
-    a single integer per attribute so it can index that attribute's embedding
-    table. The COLUMN ORDER here must match config['attributes'], because the
-    model slices column a into table a — a silent permutation would train every
-    table against the wrong vocabulary.
+    Thin wrapper over preprocessing.label_frame.load_attribute_codes, which is the
+    single definition of the one-hot -> code conversion. It lives there rather than
+    here because the sampler and the fidelity harness need the identical column
+    order, and three independent copies of an ordering contract is how a silent
+    permutation gets in.
     """
-    codes = []
-    for name, vocab_size in attribute_sizes:
-        path = os.path.join(data_dir, f'y_{name}.npy')
-        one_hot = np.load(path)
-        if one_hot.shape[1] != vocab_size:
-            raise ValueError(
-                f"{path} has {one_hot.shape[1]} columns but config declares "
-                f"{vocab_size} for '{name}'. The vocab and the arrays are out of sync."
-            )
-        codes.append(one_hot.argmax(axis=1).astype(np.int32))
-    return np.stack(codes, axis=1)
+    return load_attribute_codes(config, attribute_sizes)
 
 
 def factorized_monitoring_labels(attribute_sizes, num_samples):
@@ -595,29 +588,66 @@ def train(config, resume_from=None):
     # resized_expressions.npy currently is.
     feature_path = os.path.join(data_dir, config['feature_file'])
     attribute_sizes = config.get('attributes')
+    pcfg = PreprocessingConfig(config['image_size'], config['image_size'],
+                               config['in_channels'], dataset=DEFAULT_CONFIG.dataset)
+
+    # Row selection happens in two independent stages that compose into one index
+    # array:
+    #
+    #   split        the real train/test boundary. Every downstream consumer — the
+    #                synthetic replica, the classifier, M5 — has to see the SAME
+    #                partition, so it comes from the same make_split() the
+    #                classifiers call, over the same unfiltered label frame. Same
+    #                n, same seeded shuffle, same answer.
+    #   max_samples  a bounded probe, applied WITHIN the selection so that probing
+    #                a split-aware run still only ever touches training rows.
+    #
+    # A non-None `take` switches loading to an mmap gather, and that is the whole
+    # point: np.load(...)[train_idx] would hold the full 9.6 GB array and a 7.2 GB
+    # copy of it at the same time.
+    split_mode = config.get('split_mode') or 'none'
+    take = split_indices = None
+    if split_mode != 'none':
+        import pandas as pd
+        if not os.path.exists(pcfg.labels_path):
+            raise FileNotFoundError(
+                f"--split {split_mode} needs a label frame at {pcfg.labels_path}, which "
+                f"the {pcfg.dataset} corpus does not have. Only corpora with a labels.csv "
+                "(rnaseqdb) can be split this way."
+            )
+        frame = pd.read_csv(pcfg.labels_path)
+        strat = {a: np.load(pcfg.y_attribute_path(a)) for a in ('tissue', 'condition')
+                 if os.path.exists(pcfg.y_attribute_path(a))}
+        train_idx, test_idx = make_split(strat or None, frame, mode=split_mode)
+        split_indices = (np.sort(train_idx), np.sort(test_idx))
+        take = split_indices[0]
+        print(f"  Split '{split_mode}': training on {len(take)} of {len(frame)} samples, "
+              f"{len(test_idx)} held out")
 
     max_samples = config.get('max_samples')
     if max_samples:
-        # Bounded probe: mmap and gather an evenly-spaced subset so the full
-        # 9.6 GB array is never resident. Evenly spaced rather than a head slice
-        # because labels.csv is grouped by tissue — X_train[:64] would be one
-        # tissue and would not exercise conditioning at all.
+        if take is None:
+            take = np.arange(len(np.load(feature_path, mmap_mode='r')), dtype=np.int64)
+        n_pool = len(take)
+        # Evenly spaced rather than a head slice: labels.csv is grouped by tissue,
+        # so take[:64] would be one tissue and would not exercise conditioning.
+        pick = np.linspace(0, n_pool - 1, min(max_samples, n_pool)).astype(np.int64)
+        take = take[pick]
+        print(f"  BOUNDED PROBE: {len(take)} of {n_pool} samples, evenly spaced")
+
+    if take is not None:
         mm = np.load(feature_path, mmap_mode='r')
-        n_total = len(mm)
-        take = np.linspace(0, n_total - 1, min(max_samples, n_total)).astype(np.int64)
         X_train = np.asarray(mm[take], dtype=np.float32)
         del mm
     else:
-        take = None
         X_train = np.load(feature_path).astype(np.float32, copy=False)
 
     if attribute_sizes:
-        y_train = load_factorized_labels(data_dir, attribute_sizes)
+        y_train = load_factorized_labels(pcfg, attribute_sizes)
     else:
         y_train = np.load(os.path.join(data_dir, config['label_file'])).astype(np.float32)
     if take is not None:
         y_train = y_train[take]
-        print(f"  BOUNDED PROBE: {len(take)} of {n_total} samples, evenly spaced")
 
     print(f"  Features: {X_train.shape}")
     print(f"  Labels: {y_train.shape}")
@@ -639,6 +669,17 @@ def train(config, resume_from=None):
     norm_path = os.path.join(config['checkpoint_dir'], 'norm_constants.json')
     os.makedirs(config['checkpoint_dir'], exist_ok=True)
     diffusion_utils.save_norm_constants(norm_path)
+
+    # Persist the partition beside the checkpoint. make_split is deterministic, so
+    # this is not needed to RECOMPUTE the split — it is there so every downstream
+    # step can ASSERT it got the same one instead of recomputing and hoping. A
+    # replica generated against a different partition would leak the test set into
+    # classifier training and the resulting number would look fine.
+    if split_indices is not None:
+        split_path = os.path.join(config['checkpoint_dir'], 'split_indices.npz')
+        np.savez(split_path, train_idx=split_indices[0], test_idx=split_indices[1],
+                 mode=split_mode, n_total=len(split_indices[0]) + len(split_indices[1]))
+        print(f"  Split indices: {split_path}")
 
     # Create EDM2 dataset — σ sampled from log-normal each batch, preconditioning applied inline
     print("\n🔄 Creating dataset...")
@@ -972,6 +1013,16 @@ Examples:
         help='Override num_steps. For bounded sanity probes.'
     )
     parser.add_argument(
+        '--split',
+        type=str,
+        choices=['none', 'vinas', 'stratified', 'donor'],
+        default='none',
+        help="Train on only the TRAIN side of this split, using the same make_split() "
+             "the classifiers use. Required for any train-on-synthetic evaluation: "
+             "without it the model has seen the test set. 'none' (default) keeps the "
+             "existing behaviour of training on every sample."
+    )
+    parser.add_argument(
         '--scratch-dir',
         type=str,
         default=None,
@@ -987,6 +1038,7 @@ Examples:
         config['max_samples'] = args.max_samples
     if args.steps:
         config['num_steps'] = args.steps
+    config['split_mode'] = args.split
     if args.scratch_dir:
         config['checkpoint_dir'] = os.path.join(args.scratch_dir, 'checkpoints')
         config['sample_dir'] = os.path.join(args.scratch_dir, 'samples')
