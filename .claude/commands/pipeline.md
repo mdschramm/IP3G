@@ -4,9 +4,9 @@ step that costs money or needs something only they can do.
 
 $ARGUMENTS is `[module] [dataset]`, both optional and order-independent enough to be obvious:
 
-- **module**: `gan`, `diffusion` (default), or `classifier`. For `diffusion`, training always
-  uses `--mode diagnostic` (the only remote-capable diffusion config — see
-  `diffusion/diffusion_config.py`).
+- **module**: `gan`, `diffusion` (default), `classifier`, or `fidelity`. For `diffusion`,
+  training always uses `--mode diagnostic` (the only remote-capable diffusion config — see
+  `diffusion/diffusion_config.py`). `fidelity` is the M3.5 encoding gate, not a training run.
 - **dataset**: `gtex` (default) or `rnaseqdb` — the combined TCGA+GTEx corpus.
 
 Dataset selection is an **environment variable, not a script flag**: export `RUN_DATASET`
@@ -67,13 +67,23 @@ Steps:
    (re-auths Docker, pulls the latest image, mounts the GCS bucket — same as `/deploy` step 2).
    This is safe to re-run on an already-configured VM.
 
-6. **Kick off training (detached).** Prefix every command with `RUN_DATASET=<dataset>` (omit it,
+6. **Kick off the run (detached).** Prefix every command with `RUN_DATASET=<dataset>` (omit it,
    or use `gtex`, for the default corpus). Based on the module from $ARGUMENTS:
    - `diffusion` (default): `source gcloud_helpers && RUN_DATASET=<dataset> run_remote "diffusion/diffusion_train.py --mode diagnostic"`
    - `gan`: `source gcloud_helpers && RUN_DATASET=<dataset> run_remote "gan/model.py --train --refresh"`
-   - `classifier`: `source gcloud_helpers && RUN_DATASET=<dataset> run_remote "classifer/Classifier.py"`
+   - `classifier`:
+     - `gtex` → `source gcloud_helpers && run_remote "classifer/Classifier.py"` (single softmax)
+     - `rnaseqdb` → `source gcloud_helpers && RUN_DATASET=rnaseqdb run_remote "classifer/MultiHeadClassifier.py --report-slices"`
+       (one head per attribute; `--report-slices` prints the TCGA-only and normals-only
+       confound controls, which are the numbers actually worth reading)
+   - `fidelity`: the M3.5 encoding gate. CPU-bound and finishes in minutes, so run it in the
+     foreground rather than detached:
+     `source gcloud_helpers && RUN_DATASET=<dataset> run_remote_fg "evaluation/roundtrip_fidelity.py"`
+     Skip steps 7-8 for this one — there are no training logs to tail; report the gate table
+     directly. Results land in `output/evaluation/<dataset>/`.
 
-   The script paths do not change per dataset — only the env var does.
+   Aside from the classifier's two variants, script paths do not change per dataset — only the
+   env var does.
 
 7. **Stream logs.** Read the `tail_logs` function body from `gcloud_helpers` and run the
    underlying `gcloud compute ssh ... sudo docker logs -f --tail 300 <container>` command as a
