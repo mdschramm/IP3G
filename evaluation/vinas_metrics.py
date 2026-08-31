@@ -85,9 +85,39 @@ _vinas = _load_vinas_utils()
 _ORIGINAL = {
     "upper_diag_list": _vinas.upper_diag_list,
     "dendrogram_distance": _vinas.dendrogram_distance,
+    "pearson_correlation": _vinas.pearson_correlation,
 }
+
+
+def _clipped_pearson_correlation(x, y):
+    """Their Pearson, clamped to [-1, 1].
+
+    A correlation cannot exceed 1, but theirs standardizes with np.std and takes
+    a dot product, so rounding can land a hair above. Measured on the real
+    18,154-gene matrix: max 1.00000000000027978, an overshoot of 2.8e-13, on 4
+    off-diagonal entries out of 164.8 million.
+
+    Those 4 are fatal rather than cosmetic. hierarchical_clustering forms
+    distances as `1 - r`, so r > 1 yields a negative distance and scipy rejects
+    the linkage outright:
+        ValueError: Linkage 'Z' contains negative distances.
+
+    The failure is scale-dependent — it does not appear at a few thousand genes —
+    so it would have surfaced only on the full corpus. Clamping is exact under
+    real arithmetic and touches nothing that is genuinely in range.
+    """
+    return np.clip(_ORIGINAL["pearson_correlation"](x, y), -1.0, 1.0)
+
+
 _vinas.upper_diag_list = _fast_upper_diag_list
 _vinas.dendrogram_distance = _fast_dendrogram_distance
+_vinas.pearson_correlation = _clipped_pearson_correlation
+
+# correlations_list and hierarchical_clustering take the correlation function as a
+# DEFAULT ARGUMENT, which binds the original at def time — rebinding the module
+# attribute alone would leave both still calling the unclamped version.
+_vinas.correlations_list.__defaults__ = (_clipped_pearson_correlation,)
+_vinas.hierarchical_clustering.__defaults__ = (_clipped_pearson_correlation,)
 
 # Re-exported unchanged from their module
 gamma_coefficients = _vinas.gamma_coefficients

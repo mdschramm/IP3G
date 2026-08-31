@@ -44,6 +44,38 @@ def test_dendrogram_distance(seed=0):
     return ok
 
 
+def test_pearson_clip(seed=0):
+    """Clamping must be a no-op on in-range values, and must fix the overshoot."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(60, 40))
+    theirs = vm._ORIGINAL["pearson_correlation"](x, x)
+    ours = vm._clipped_pearson_correlation(x, x)
+    inrange = np.abs(theirs) <= 1.0
+    agree = np.array_equal(theirs[inrange], ours[inrange])
+    bounded = bool((np.abs(ours) <= 1.0).all())
+    print(f"  pearson clip         agrees in-range={agree}  output bounded={bounded}  "
+          f"overshoot fixed={int((theirs > 1.0).sum())}")
+
+    # the defaults on both callers must route through the clipped version too
+    routed = (vm.correlations_list.__defaults__[0] is vm._clipped_pearson_correlation
+              and vm.hierarchical_clustering.__defaults__[0] is vm._clipped_pearson_correlation)
+    print(f"  default-arg rebinding correlations_list + hierarchical_clustering={routed}")
+    return agree and bounded and routed
+
+
+def test_no_negative_linkage(seed=0):
+    """A linkage built from clipped correlations must be valid for scipy."""
+    from scipy.cluster.hierarchy import cophenet, is_valid_linkage
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(40, 150))
+    x[:, :20] = x[:, :1]           # perfectly collinear genes -> r == 1 exactly
+    z = vm.hierarchical_clustering(x)
+    ok = is_valid_linkage(z) and np.all(z[:, 2] >= 0)
+    cophenet(z)                    # must not raise
+    print(f"  linkage from collinear genes valid={ok}  min dist={z[:, 2].min():.3e}")
+    return bool(ok)
+
+
 def test_gamma_end_to_end(seed=0):
     """A perfect copy must score 1.0; unrelated data must not."""
     rng = np.random.default_rng(seed)
@@ -61,6 +93,8 @@ if __name__ == "__main__":
     results = [
         ("upper_diag_list", test_upper_diag_list()),
         ("dendrogram_distance", test_dendrogram_distance()),
+        ("pearson clip", test_pearson_clip()),
+        ("no negative linkage", test_no_negative_linkage()),
         ("gamma end-to-end", test_gamma_end_to_end()),
     ]
     print()
