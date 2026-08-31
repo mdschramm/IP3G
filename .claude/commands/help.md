@@ -9,7 +9,8 @@ Print the following reference (do not run any tools, just output this text):
 | Command | Usage | What it does |
 |---------|-------|--------------|
 | `/deploy` | `/deploy [--full\|--base]` | Push code to GCP. Default: fast build (code only, ~1-2 min). `--full` rebuilds everything including deps. `--base` rebuilds only the dependency layer. |
-| `/train` | `/train <module>` | Start a remote training run on the A100 VM. Modules: `gan`, `diffusion`, `classifier`. Tails logs automatically. |
+| `/pipeline` | `/pipeline [module]` | Full remote workflow end-to-end: deploy → (confirm) start the VM if it's off → pull the new image → kick off training → stream logs → (confirm) stop the VM. Pauses for explicit confirmation before every start/stop since those cost money. Module: `gan`, `diffusion` (default), or `classifier`. |
+| `/train` | `/train <module>` | Start a remote training run on the A100 VM (assumes the VM is already up and the image is current — use `/pipeline` if it isn't). Modules: `gan`, `diffusion`, `classifier`. Tails logs automatically. |
 | `/diagnose` | `/diagnose` | Run a 1000-step diagnostic training run on the A100 using the full remote architecture (~10 min). Streams logs, syncs outputs, then runs `diffusion/diagnostics.py` locally and reports results. Use before a full run to catch config/architecture issues early. |
 | `/logs` | `/logs [container-name]` | Stream logs from the running container (default: `ip3g`). |
 | `/sync` | `/sync [module]` | Push VM outputs → GCS → download to local `./output/`. Module optional (`gan`, `diffusion`, `classifier`); omit to sync all. |
