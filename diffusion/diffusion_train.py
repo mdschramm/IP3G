@@ -699,6 +699,9 @@ def train(config, resume_from=None):
         sigma_data=float(config.get('sigma_data', 0.139)),
         attribute_vocab_sizes=([v for _, v in attribute_sizes] if attribute_sizes else None),
     )
+    # The loader holds its own host-pinned copy now, so drop ours: keeping both would
+    # sit two 7.2GB arrays in the VM's 26GB of RAM for the whole run.
+    del X_train
     print(f"  Batch size: {config['batch_size']}")
     print(f"  Classifier-free dropout: {config['dropout_rate']*100:.0f}%"
           f"{' per attribute, independently' if attribute_sizes else ''}")

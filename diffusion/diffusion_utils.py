@@ -178,9 +178,28 @@ def prepare_dataset_conditional_edm(X, y, num_classes, batch_size=32, dropout_ra
         y = y[keep]
         print(f"  Excluded classes {excluded_classes}: {keep.sum():,} / {len(keep):,} samples retained")
 
-    ds = tf.data.Dataset.from_tensor_slices((X, y))
+    # Pin the corpus to the host. With a GPU visible, tf.data materialises a
+    # from_tensor_slices source as a *device* tensor: on the T4 that was a single
+    # 7,193,231,360-byte GPU_0_bfc allocation — exactly N*128*128*16*4, half of the
+    # card's 15GB — leaving too little for activations, and training died in a
+    # GroupNormalization gradient. The samples have to cross to the GPU one batch at
+    # a time, not all at once.
+    with tf.device('/CPU:0'):
+        X_src = tf.constant(X)
+        y_src = tf.constant(y)
+
+    # Shuffle indices rather than samples. shuffle() over the samples themselves fills
+    # its buffer with decoded images (~1MB each here, so a 10k buffer is another ~10GB
+    # of host RAM); an int64 index buffer spanning the whole corpus costs ~8 bytes a
+    # row and still gives a full reshuffle every epoch.
+    ds = tf.data.Dataset.range(len(X))
     if shuffle:
-        ds = ds.shuffle(10_000)
+        ds = ds.shuffle(len(X), reshuffle_each_iteration=True)
+    ds = ds.batch(batch_size, drop_remainder=drop_remainder)
+
+    def gather_fn(idx):
+        with tf.device('/CPU:0'):
+            return tf.gather(X_src, idx), tf.gather(y_src, idx)
 
     def map_fn(x, lbl):
         return prepare_batch_conditional_edm(
@@ -189,7 +208,9 @@ def prepare_dataset_conditional_edm(X, y, num_classes, batch_size=32, dropout_ra
             attribute_vocab_sizes,
         )
 
-    return ds.batch(batch_size, drop_remainder=drop_remainder).map(
+    return ds.map(
+        gather_fn, num_parallel_calls=tf.data.AUTOTUNE
+    ).map(
         map_fn, num_parallel_calls=tf.data.AUTOTUNE
     ).prefetch(tf.data.AUTOTUNE)
 
