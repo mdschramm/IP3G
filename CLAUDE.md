@@ -139,7 +139,30 @@ RUN_DATASET=rnaseqdb python -m classifer.ClassiferSmall --split vinas --attribut
 
 # 4. the comparison table
 RUN_DATASET=rnaseqdb python -m evaluation.tstr_report
+
+# 5. M6b — the same replica decoded back to gene vectors, MLP(64,64) as in the paper
+RUN_DATASET=rnaseqdb python -m evaluation.decoded_tstr \
+    --synthetic-dir output/diffusion/diagnostic/rnaseqdb/synthetic_w1 --mode diagnostic
 ```
+
+### M6b — TSTR on decoded gene vectors
+
+M6's CNN row differs from Viñas in the generator *and* the classifier family *and* the data
+representation, so a gap between the two numbers cannot be attributed to any one of them.
+`evaluation/decoded_tstr.py` removes two: it runs the same replica back through
+`reconstruct_gene_vectors` and hands the resulting `[N, 18154]` vectors to the same
+`vinas_metrics.tstr_scores` MLP(64,64) harness, leaving the generator as the difference. It also
+prints per-gene mean/variance agreement and the fraction of synthetic values outside the real
+per-gene range — a generator can score well on TSTR while emitting vectors that are plainly not
+expression data, since a classifier only needs the classes to stay separable.
+
+Two things it does that M5's TSTR does not: the training rows are the decoded replica of the
+**6,860-sample train split** and the test rows are the **2,287 real held-out samples** (M5 splits
+a 512-sample slice internally and never touches the held-out set), and replica rows are matched to
+corpus rows **by `sample_id`**, not by position — a bounded probe replica holds evenly-spaced rows,
+so a positional assumption is wrong there and would pair correctly-shaped vectors with the wrong
+labels. It standardizes on real *train* statistics, where M3.5 and M5 use whatever real slice they
+hold; the difference is tiny but it is the leak-free choice and the output JSON records it.
 
 `--synthetic-dir` swaps the *training* rows only; validation always stays on the real arrays at
 `val_idx`. `ClassiferSmall`'s compiled `f1_m` is a batch-summed micro-F1 — under a one-hot
